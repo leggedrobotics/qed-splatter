@@ -1,0 +1,16 @@
+[project]
+name = "QED-Splatter"
+description = "Quick and Easy Depth Splatter"
+version = "0.1.0"
+
+dependencies = ["nerfstudio >= 1.1.0"]
+
+[tool.setuptools.packages.find]
+include = ["qed_splatter*"]
+
+# register the entry point of your new method here:
+[project.entry-points.'nerfstudio.method_configs']
+method-template = 'qed_splatter.config:qed_splatter_config'
+
+[project.entry-points.'nerfstudio.dataparser_configs']
+custom-dataparser = 'qed_splatter.parser_config:qed_splatter_dataparser'

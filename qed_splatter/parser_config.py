@@ -1,0 +1,7 @@
+
+from __future__ import annotations
+
+from nerfstudio.plugins.registry_dataparser import DataParserSpecification
+from qed_splatter.dataparser import QEDSplatterDataParserConfig
+
+qed_splatter_dataparser = DataParserSpecification(config=QEDSplatterDataParserConfig())
