@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Type, Union
+from typing import Dict, List, Literal, Optional, Tuple, Type, Union
 
 try:
     from gsplat.rendering import rasterization
@@ -13,7 +13,7 @@ from nerfstudio.models.splatfacto import SplatfactoModelConfig, SplatfactoModel
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.utils.misc import torch_compile
 import torchvision.transforms.functional as TF
-from qed_splatter.metrics import RGBMetrics, DepthMetrics
+from qed_splatter.metrics import RGBMetrics, DepthMetrics, NormalMetrics
 
 @torch_compile()
 def get_viewmat(optimized_camera_to_world):
@@ -37,8 +37,8 @@ def get_viewmat(optimized_camera_to_world):
 @dataclass
 class QEDSplatterModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: QEDSplatterModel)
-    depth_lambda: float = 0.2  # Weight for depth loss, found 0.2 to 0.3 to work well
-    random_scale: float = 100.0  # Random scale for the gaussians, set to 1 if you enable scaling
+    depth_lambda: float = 0.3  # Weight for depth loss, found 0.2 to 0.3 to work well
+    #random_scale: float = 100.0  # Random scale for the gaussians, set to 1 if you enable scaling
     output_depth_during_training: bool = True
 
 
@@ -62,6 +62,7 @@ class QEDSplatterModel(SplatfactoModel):
 
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
+        self.normal_metrics = NormalMetrics()
         self.mse_loss = torch.nn.MSELoss()
 
 
@@ -129,13 +130,13 @@ class QEDSplatterModel(SplatfactoModel):
                     batch["depth_image"].shape[0] // d,
                     batch["depth_image"].shape[1] // d,
                 )
-                sensor_depth_gt = TF.resize(
+                depth_gt = TF.resize(
                     batch["depth_image"].permute(2, 0, 1), depth_size, antialias=None
                 ).permute(1, 2, 0)
         else:
             gt_img = batch["image"]
             if "depth_image" in batch:
-                sensor_depth_gt = batch["depth_image"]
+                depth_gt = batch["depth_image"]
 
         metrics_dict = {}
         gt_rgb = gt_img.to(self.device)  # RGB or RGBA image
@@ -143,41 +144,37 @@ class QEDSplatterModel(SplatfactoModel):
             outputs["rgb"][0, ...] if outputs["rgb"].dim() == 4 else outputs["rgb"]
         )
 
-        with torch.no_grad():
-            (psnr, ssim, lpips) = self.rgb_metrics(
-                gt_rgb.permute(2, 0, 1).unsqueeze(0),
-                predicted_rgb.permute(2, 0, 1).unsqueeze(0).to(self.device),
-            )
-            rgb_mse = self.mse_loss(gt_rgb.permute(2, 0, 1), predicted_rgb.permute(2, 0, 1))
-            rgb_metrics = {
-                "rgb_mse": float(rgb_mse),
-                "rgb_psnr": float(psnr.item()),
-                "rgb_ssim": float(ssim),
-                "rgb_lpips": float(lpips),
-            }
-            metrics_dict.update(rgb_metrics)
+        # comment out for now, as it will slow down the training speed.
+        (psnr, ssim, lpips) = self.rgb_metrics(
+            gt_rgb.permute(2, 0, 1).unsqueeze(0),
+            predicted_rgb.permute(2, 0, 1).unsqueeze(0).to(self.device),
+        )
+        rgb_mse = self.mse_loss(gt_rgb.permute(2, 0, 1), predicted_rgb.permute(2, 0, 1))
+        metrics_dict = {
+            "rgb_mse": float(rgb_mse),
+            "rgb_psnr": float(psnr.item()),
+            "rgb_ssim": float(ssim),
+            "rgb_lpips": float(lpips),
+        }
 
         metrics_dict["gaussian_count"] = self.num_points
 
+        if "depth_image" in batch:
+            predicted_depth = outputs["depth"]
+            (abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3) = self.depth_metrics(
+                predicted_depth.permute(2, 0, 1), depth_gt.permute(2, 0, 1)
+            )
 
-        with torch.no_grad():
-            if "depth_image" in batch:
-                predicted_depth = outputs["depth"]
-                (abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3) = self.depth_metrics(
-                    predicted_depth.permute(2, 0, 1), sensor_depth_gt.permute(2, 0, 1)
-                )
-
-                depth_metrics = {
-                    "depth_abs_rel": float(abs_rel.item()),
-                    "depth_sq_rel": float(sq_rel.item()),
-                    "depth_rmse": float(rmse.item()),
-                    "depth_rmse_log": float(rmse_log.item()),
-                    "depth_a1": float(a1.item()),
-                    "depth_a2": float(a2.item()),
-                    "depth_a3": float(a3.item()),
-                }
-                metrics_dict.update(depth_metrics)
-
+            depth_metrics = {
+                "depth_abs_rel": float(abs_rel.item()),
+                "depth_sq_rel": float(sq_rel.item()),
+                "depth_rmse": float(rmse.item()),
+                "depth_rmse_log": float(rmse_log.item()),
+                "depth_a1": float(a1.item()),
+                "depth_a2": float(a2.item()),
+                "depth_a3": float(a3.item()),
+            }
+            metrics_dict.update(depth_metrics)
 
         # track scales
         metrics_dict.update(
@@ -185,6 +182,125 @@ class QEDSplatterModel(SplatfactoModel):
         )
 
         return metrics_dict
+
+    def get_image_metrics_and_images(
+        self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
+    ) -> Tuple[Dict[str, float], Dict[str, torch.Tensor]]:
+        """Main function for eval/test images
+
+        Args:
+            image_idx: Index of the image.
+            step: Current step.
+            batch: Batch of data.
+            outputs: Outputs of the model.
+
+        Returns:
+            A dictionary of metrics.
+        """
+
+        gt_rgb = batch["image"].to(self.device)
+        predicted_rgb = (
+            outputs["rgb"][0, ...] if outputs["rgb"].dim() == 4 else outputs["rgb"]
+        )
+        predicted_depth = (
+            outputs["depth"][0, ...]
+            if outputs["depth"].dim() == 4
+            else outputs["depth"]
+        )
+        predicted_normal = (
+            outputs["normal"][0, ...]
+            if outputs["normal"].dim() == 4
+            else outputs["normal"]
+        )
+
+        combined_rgb = torch.cat([gt_rgb, predicted_rgb], dim=1)
+        combined_depth = (
+            predicted_depth  # a placeholder if no sensor depth is available
+        )
+        combined_normal = predicted_normal  # a placeholder if no gt normal is available
+
+        # Switch images from [H, W, C] to [1, C, H, W] for metrics computations
+        gt_rgb = torch.moveaxis(gt_rgb, -1, 0)[None, ...]
+        predicted_rgb = torch.moveaxis(predicted_rgb, -1, 0)[None, ...]
+
+        if "mask" in batch:
+            mask = batch["mask"].to(self.device)
+            gt_rgb = gt_rgb * mask
+            predicted_rgb = predicted_rgb * mask
+
+        psnr = self.psnr(gt_rgb, predicted_rgb)
+        ssim = self.ssim(gt_rgb, predicted_rgb)
+        lpips = self.lpips(gt_rgb, predicted_rgb)
+
+        # all of these metrics will be logged as scalars
+        metrics_dict = {
+            "rgb_psnr": float(psnr.item()),
+            "rgb_ssim": float(ssim),
+        }  # type: ignore
+        metrics_dict["rgb_lpips"] = float(lpips)
+
+        predicted_depth = outputs["depth"]
+        if "sensor_depth" in batch:
+            gt_depth = batch["sensor_depth"].to(self.device)
+
+            if predicted_depth.shape[:2] != gt_depth.shape[:2]:
+                predicted_depth = TF.resize(
+                    predicted_depth.permute(2, 0, 1), gt_depth.shape[:2], antialias=None
+                ).permute(1, 2, 0)
+
+            gt_depth = gt_depth.to(torch.float32)  # it is in float64 previous
+
+            if "mask" in batch:
+                gt_depth = gt_depth * mask
+                predicted_depth = predicted_depth * mask
+
+            # add depth eval metrics
+
+            (abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3) = self.depth_metrics(
+                predicted_depth.permute(2, 0, 1), gt_depth.permute(2, 0, 1)
+            )
+            depth_metrics = {
+                "depth_abs_rel": float(abs_rel.item()),
+                "depth_sq_rel": float(sq_rel.item()),
+                "depth_rmse": float(rmse.item()),
+                "depth_rmse_log": float(rmse_log.item()),
+                "depth_a1": float(a1.item()),
+                "depth_a2": float(a2.item()),
+                "depth_a3": float(a3.item()),
+            }
+            metrics_dict.update(depth_metrics)
+            combined_depth = torch.cat([gt_depth, predicted_depth], dim=1)
+
+        if "normal" in batch:
+            gt_normal = batch["normal"].to(self.device)
+
+            if gt_normal.shape != predicted_normal.shape:
+                predicted_normal = TF.resize(
+                    predicted_normal.permute(2, 0, 1),
+                    gt_normal.shape[:2],
+                    antialias=None,
+                ).permute(1, 2, 0)
+
+            (mae, rmse, mean_err, med_err) = self.normal_metrics(
+                predicted_normal.permute(2, 0, 1).unsqueeze(0),
+                gt_normal.permute(2, 0, 1).unsqueeze(0),
+            )
+            normal_metrics = {
+                "normal_mae": float(mae.item()),
+                "normal_rsme": float(rmse.item()),
+                "normal_mean_err": float(mean_err.item()),
+                "normal_med_err": float(med_err.item()),
+            }
+            metrics_dict.update(normal_metrics)
+            combined_normal = torch.cat([gt_normal, predicted_normal], dim=1)
+
+        images_dict = {
+            "img": combined_rgb,
+            "depth": combined_depth,
+            "normal": combined_normal,
+        }
+
+        return metrics_dict, images_dict
 
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """

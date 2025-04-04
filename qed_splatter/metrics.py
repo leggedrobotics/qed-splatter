@@ -154,3 +154,28 @@ class DepthMetrics(nn.Module):
         sq_rel = ((gt - pred) ** 2 / gt).mean()
 
         return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
+
+class NormalMetrics(nn.Module):
+    """
+    Computation of error metrics between predicted and ground truth normal images
+
+    @return mae, rmse, mean_err, med_err
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__()
+
+    @torch.no_grad()
+    def forward(self, pred, gt):
+        b, c, _, _ = gt.shape
+        # calculate MAE
+        mae = mean_angular_error(pred, gt).mean()
+        # calculate RMSE
+        rmse = torch.sqrt(torch.mean(torch.square(gt - pred), dim=[1, 2, 3])).mean()
+        # calculate Mean
+        mean_err = torch.mean(torch.abs(gt - pred), dim=[1, 2, 3]).mean()
+        # calculate Median
+        med_err = torch.median(
+            torch.abs(gt.view(b, c, -1) - pred.view(b, c, -1))
+        ).mean()
+        return mae, rmse, mean_err, med_err
