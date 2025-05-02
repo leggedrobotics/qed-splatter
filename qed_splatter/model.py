@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Type, Union
+from typing import Dict, List, Type, Union, Optional, Tuple
+import cv2
 
 try:
     from gsplat.rendering import rasterization
@@ -9,11 +10,15 @@ except ImportError:
     print("Please install gsplat>=1.0.0")
 
 import torch
+import torch.nn.functional as F
+from gsplat.cuda_legacy._torch_impl import quat_to_rotmat
 from nerfstudio.models.splatfacto import SplatfactoModelConfig, SplatfactoModel
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.utils.misc import torch_compile
 import torchvision.transforms.functional as TF
 from qed_splatter.metrics import RGBMetrics, DepthMetrics
+from torch import Tensor
+from gsplat import rasterize_gaussians
 
 @torch_compile()
 def get_viewmat(optimized_camera_to_world):
@@ -33,12 +38,128 @@ def get_viewmat(optimized_camera_to_world):
     viewmat[:, :3, 3:4] = T_inv
     return viewmat
 
+def pcd_to_normal(xyz: Tensor):
+    hd, wd, _ = xyz.shape
+    bottom_point = xyz[..., 2:hd, 1 : wd - 1, :]
+    top_point = xyz[..., 0 : hd - 2, 1 : wd - 1, :]
+    right_point = xyz[..., 1 : hd - 1, 2:wd, :]
+    left_point = xyz[..., 1 : hd - 1, 0 : wd - 2, :]
+    left_to_right = right_point - left_point
+    bottom_to_top = top_point - bottom_point
+    xyz_normal = torch.cross(left_to_right, bottom_to_top, dim=-1)
+    xyz_normal = torch.nn.functional.normalize(xyz_normal, p=2, dim=-1)
+    xyz_normal = torch.nn.functional.pad(
+        xyz_normal.permute(2, 0, 1), (1, 1, 1, 1), mode="constant"
+    ).permute(1, 2, 0)
+    return xyz_normal
+
+def normal_from_depth_image(
+    depths: Tensor,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    img_size: tuple,
+    c2w: Tensor,
+    device: torch.device,
+    smooth: bool = False,
+):
+    """estimate normals from depth map"""
+    if smooth:
+        if torch.count_nonzero(depths) > 0:
+            print("Input depth map contains 0 elements, skipping smoothing filter")
+        else:
+            kernel_size = (9, 9)
+            depths = torch.from_numpy(
+                cv2.GaussianBlur(depths.cpu().numpy(), kernel_size, 0)
+            ).to(device)
+    means3d, _ = get_means3d_backproj(depths, fx, fy, cx, cy, img_size, c2w, device)
+    means3d = means3d.view(img_size[1], img_size[0], 3)
+    normals = pcd_to_normal(means3d)
+    return normals
+
+
+def get_camera_coords(img_size: tuple, pixel_offset: float = 0.5) -> Tensor:
+    """Generates camera pixel coordinates [W,H]
+
+    Returns:
+        stacked coords [H*W,2] where [:,0] corresponds to W and [:,1] corresponds to H
+    """
+
+    # img size is (w,h)
+    image_coords = torch.meshgrid(
+        torch.arange(img_size[0]),
+        torch.arange(img_size[1]),
+        indexing="xy",  # W = u by H = v
+    )
+    image_coords = (
+        torch.stack(image_coords, dim=-1) + pixel_offset
+    )  # stored as (x, y) coordinates
+    image_coords = image_coords.view(-1, 2)
+    image_coords = image_coords.float()
+
+    return image_coords
+
+def get_means3d_backproj(
+    depths: Tensor,
+    fx: float,
+    fy: float,
+    cx: int,
+    cy: int,
+    img_size: tuple,
+    c2w: Tensor,
+    device: torch.device,
+    mask: Optional[Tensor] = None,
+) -> Tuple[Tensor, List]:
+    """Backprojection using camera intrinsics and extrinsics
+
+    image_coords -> (x,y,depth) -> (X, Y, depth)
+
+    Returns:
+        Tuple of (means: Tensor, image_coords: Tensor)
+    """
+
+    if depths.dim() == 3:
+        depths = depths.view(-1, 1)
+    elif depths.shape[-1] != 1:
+        depths = depths.unsqueeze(-1).contiguous()
+        depths = depths.view(-1, 1)
+    if depths.dtype != torch.float:
+        depths = depths.float()
+        c2w = c2w.float()
+    if c2w.device != device:
+        c2w = c2w.to(device)
+
+    image_coords = get_camera_coords(img_size)
+    image_coords = image_coords.to(device)  # note image_coords is (H,W)
+
+    # TODO: account for skew / radial distortion
+    means3d = torch.empty(
+        size=(img_size[0], img_size[1], 3), dtype=torch.float32, device=device
+    ).view(-1, 3)
+    means3d[:, 0] = (image_coords[:, 0] - cx) * depths[:, 0] / fx  # x
+    means3d[:, 1] = (image_coords[:, 1] - cy) * depths[:, 0] / fy  # y
+    means3d[:, 2] = depths[:, 0]  # z
+
+    if mask is not None:
+        if not torch.is_tensor(mask):
+            mask = torch.tensor(mask, device=depths.device)
+        means3d = means3d[mask]
+        image_coords = image_coords[mask]
+
+    if c2w is None:
+        c2w = torch.eye((means3d.shape[0], 4, 4), device=device)
+
+    # to world coords
+    means3d = means3d @ torch.linalg.inv(c2w[..., :3, :3]) + c2w[..., :3, 3]
+    return means3d, image_coords
 
 @dataclass
 class QEDSplatterModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: QEDSplatterModel)
+    predict_normals: bool = True
     depth_lambda: float = 0.2  # Weight for depth loss, found 0.2 to 0.3 to work well
-    random_scale: float = 100.0  # Random scale for the gaussians, set to 1 if you enable scaling
+    random_scale: float = 1.0  # Random scale for the gaussians, set to 1 if you enable scaling
     output_depth_during_training: bool = True
 
 
@@ -51,6 +172,7 @@ class QEDSplatterModel(SplatfactoModel):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        self.camera = None
 
     def populate_modules(self):
         """
@@ -281,10 +403,16 @@ class QEDSplatterModel(SplatfactoModel):
         self.xys = self.info["means2d"]  # [1, N, 2]
         self.radii = self.info["radii"][0]  # [N]
         alpha = alpha[:, ...]
+        self.depths = info["depths"]
+        self.conics = info["conics"]
+        self.num_tiles_hit = info["tiles_per_gauss"]
 
         background = self._get_background_color()
         rgb = render[:, ..., :3] + (1 - alpha) * background
         rgb = torch.clamp(rgb, 0.0, 1.0)
+
+        # visible gaussians
+        self.vis_indices = torch.where(self.radii > 0)[0]
 
         if render_mode == "RGB+D":
             depth_im = render[:, ..., 3:4]
@@ -298,9 +426,78 @@ class QEDSplatterModel(SplatfactoModel):
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
+        normals_im = torch.full(rgb.shape, 0.0)
+        if self.config.predict_normals:
+            quats_crop = quats_crop / quats_crop.norm(dim=-1, keepdim=True)
+            normals = F.one_hot(
+                torch.argmin(scales_crop, dim=-1), num_classes=3
+            ).float()
+            rots = quat_to_rotmat(quats_crop)
+            normals = torch.bmm(rots, normals[:, :, None]).squeeze(-1)
+            normals = F.normalize(normals, dim=1)
+            viewdirs = (
+                    -means_crop.detach() + camera.camera_to_worlds.detach()[..., :3, 3]
+            )
+            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+            dots = (normals * viewdirs).sum(-1)
+            negative_dot_indices = dots < 0
+            normals[negative_dot_indices] = -normals[negative_dot_indices]
+            # update parameter group normals
+            self.gauss_params["normals"] = normals
+            # convert normals from world space to camera space
+            normals = normals @ camera.camera_to_worlds.squeeze(0)[:3, :3]
+
+            xys = self.xys[0, ...].detach()
+
+            normals_im: Tensor = rasterize_gaussians(  # type: ignore
+                xys,
+                self.depths[0, ...],
+                self.radii,
+                self.conics[0, ...],
+                self.num_tiles_hit[0, ...],
+                normals,
+                torch.sigmoid(opacities_crop),
+                H,
+                W,
+                BLOCK_WIDTH,
+            )
+            # convert normals from [-1,1] to [0,1]
+            normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
+            normals_im = (normals_im + 1) / 2
+
+        if hasattr(camera, "metadata"):
+            if camera.metadata is not None and "cam_idx" in camera.metadata:
+                self.camera_idx = camera.metadata["cam_idx"]  # type: ignore
+        self.camera = camera
+
+        # Surface normal computation from depth map
+        surface_normal = None
+        if depth_im is not None:
+            c2w = self.camera.camera_to_worlds.squeeze(0).detach()
+            c2w = c2w @ torch.diag(
+                torch.tensor([1, -1, -1, 1], device=c2w.device, dtype=c2w.dtype)
+            )
+            surface_normal = normal_from_depth_image(
+                depths=depth_im.detach(),
+                fx=self.camera.fx.item(),
+                fy=self.camera.fy.item(),
+                cx=self.camera.cx.item(),
+                cy=self.camera.cy.item(),
+                img_size=depth_im.shape[:2],
+                c2w=torch.eye(4, dtype=torch.float, device=depth_im.device),
+                device=self.device,
+                smooth=False,
+            )
+            surface_normal = surface_normal @ torch.diag(
+                torch.tensor([1, -1, -1], device=depth_im.device, dtype=depth_im.dtype)
+            )
+            surface_normal = (1 + surface_normal) / 2
+
         return {
-            "rgb": rgb.squeeze(0),  # type: ignore
-            "depth": depth_im,  # type: ignore
-            "accumulation": alpha.squeeze(0),  # type: ignore
-            "background": background,  # type: ignore
-        }  # type: ignore
+            "rgb": rgb.squeeze(0),
+            "depth": depth_im,
+            "normal": normals_im,  # predicted normal from gaussians
+            "surface_normal": surface_normal,  # normal from surface / depth
+            "accumulation": alpha.squeeze(0),
+            "background": background,
+        }
