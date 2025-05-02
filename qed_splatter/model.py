@@ -308,13 +308,9 @@ class QEDSplatterModel(SplatfactoModel):
 
         return metrics_dict
 
-    def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
-        """
-        Generates the outputs of the model given a camera.
-
-        @param camera: Cameras object containing the camera parameters
-        @return: Dictionary containing the outputs of the model
-        """
+    def get_outputs(
+        self, camera: Cameras
+    ) -> Dict[str, Union[torch.Tensor, List[Tensor]]]:
         if not isinstance(camera, Cameras):
             print("Called get_outputs with not a camera")
             return {}
@@ -330,7 +326,9 @@ class QEDSplatterModel(SplatfactoModel):
             crop_ids = self.crop_box.within(self.means).squeeze()
             if crop_ids.sum() == 0:
                 return self.get_empty_outputs(
-                    int(camera.width.item()), int(camera.height.item()), self.background_color
+                    int(camera.width.item()),
+                    int(camera.height.item()),
+                    self.background_color,
                 )
         else:
             crop_ids = None
@@ -350,9 +348,13 @@ class QEDSplatterModel(SplatfactoModel):
             scales_crop = self.scales
             quats_crop = self.quats
 
-        colors_crop = torch.cat((features_dc_crop[:, None, :], features_rest_crop), dim=1)
+        colors_crop = torch.cat(
+            (features_dc_crop[:, None, :], features_rest_crop), dim=1
+        )
 
-        BLOCK_WIDTH = 16  # this controls the tile size of rasterization, 16 is a good default
+        BLOCK_WIDTH = (
+            16  # this controls the tile size of rasterization, 16 is a good default
+        )
         camera_scale_fac = self._get_downscale_factor()
         camera.rescale_output_resolution(1 / camera_scale_fac)
         viewmat = get_viewmat(optimized_camera_to_world)
@@ -365,15 +367,14 @@ class QEDSplatterModel(SplatfactoModel):
         if self.config.rasterize_mode not in ["antialiased", "classic"]:
             raise ValueError("Unknown rasterize_mode: %s", self.config.rasterize_mode)
 
-        if self.config.output_depth_during_training or not self.training:
-            render_mode = "RGB+D"
-        else:
-            render_mode = "RGB"
+        render_mode = "RGB+D"
 
         if self.config.sh_degree > 0:
-            sh_degree_to_use = min(self.step // self.config.sh_degree_interval, self.config.sh_degree)
+            sh_degree_to_use = min(
+                self.step // self.config.sh_degree_interval, self.config.sh_degree
+            )
         else:
-            colors_crop = torch.sigmoid(colors_crop).squeeze(1)  # [N, 1, 3] -> [N, 3]
+            colors_crop = torch.sigmoid(colors_crop)
             sh_degree_to_use = None
 
         render, alpha, self.info = rasterization(
@@ -416,15 +417,11 @@ class QEDSplatterModel(SplatfactoModel):
 
         if render_mode == "RGB+D":
             depth_im = render[:, ..., 3:4]
-            depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
+            depth_im = torch.where(
+                alpha > 0, depth_im, depth_im.detach().max()
+            ).squeeze(0)
         else:
             depth_im = None
-
-        del render
-        torch.cuda.empty_cache()
-
-        if background.shape[0] == 3 and not self.training:
-            background = background.expand(H, W, 3)
 
         normals_im = torch.full(rgb.shape, 0.0)
         if self.config.predict_normals:
@@ -436,7 +433,7 @@ class QEDSplatterModel(SplatfactoModel):
             normals = torch.bmm(rots, normals[:, :, None]).squeeze(-1)
             normals = F.normalize(normals, dim=1)
             viewdirs = (
-                    -means_crop.detach() + camera.camera_to_worlds.detach()[..., :3, 3]
+                -means_crop.detach() + camera.camera_to_worlds.detach()[..., :3, 3]
             )
             viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
             dots = (normals * viewdirs).sum(-1)
@@ -470,28 +467,25 @@ class QEDSplatterModel(SplatfactoModel):
                 self.camera_idx = camera.metadata["cam_idx"]  # type: ignore
         self.camera = camera
 
-        # Surface normal computation from depth map
-        surface_normal = None
-        if depth_im is not None:
-            c2w = self.camera.camera_to_worlds.squeeze(0).detach()
-            c2w = c2w @ torch.diag(
-                torch.tensor([1, -1, -1, 1], device=c2w.device, dtype=c2w.dtype)
-            )
-            surface_normal = normal_from_depth_image(
-                depths=depth_im.detach(),
-                fx=self.camera.fx.item(),
-                fy=self.camera.fy.item(),
-                cx=self.camera.cx.item(),
-                cy=self.camera.cy.item(),
-                img_size=depth_im.shape[:2],
-                c2w=torch.eye(4, dtype=torch.float, device=depth_im.device),
-                device=self.device,
-                smooth=False,
-            )
-            surface_normal = surface_normal @ torch.diag(
-                torch.tensor([1, -1, -1], device=depth_im.device, dtype=depth_im.dtype)
-            )
-            surface_normal = (1 + surface_normal) / 2
+        c2w = self.camera.camera_to_worlds.squeeze(0).detach()
+        c2w = c2w @ torch.diag(
+            torch.tensor([1, -1, -1, 1], device=c2w.device, dtype=c2w.dtype)
+        )
+        surface_normal = normal_from_depth_image(
+            depths=depth_im.detach(),
+            fx=self.camera.fx.item(),
+            fy=self.camera.fy.item(),
+            cx=self.camera.cx.item(),
+            cy=self.camera.cy.item(),
+            img_size=depth_im.shape[:2],
+            c2w=torch.eye(4, dtype=torch.float, device=depth_im.device),
+            device=self.device,
+            smooth=False,
+        )
+        surface_normal = surface_normal @ torch.diag(
+            torch.tensor([1, -1, -1], device=depth_im.device, dtype=depth_im.dtype)
+        )
+        surface_normal = (1 + surface_normal) / 2
 
         return {
             "rgb": rgb.squeeze(0),
