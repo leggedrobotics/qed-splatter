@@ -462,22 +462,16 @@ class QEDSplatterModel(SplatfactoModel):
             normals_im = normals_im / normals_im.norm(dim=-1, keepdim=True)
             normals_im = (normals_im + 1) / 2
 
-        if hasattr(camera, "metadata"):
-            if camera.metadata is not None and "cam_idx" in camera.metadata:
-                self.camera_idx = camera.metadata["cam_idx"]  # type: ignore
-        self.camera = camera
-
-        c2w = self.camera.camera_to_worlds.squeeze(0).detach()
-        c2w = c2w @ torch.diag(
-            torch.tensor([1, -1, -1, 1], device=c2w.device, dtype=c2w.dtype)
-        )
         surface_normal = normal_from_depth_image(
             depths=depth_im.detach(),
-            fx=self.camera.fx.item(),
-            fy=self.camera.fy.item(),
-            cx=self.camera.cx.item(),
-            cy=self.camera.cy.item(),
-            img_size=depth_im.shape[:2],
+            fx=camera.fx.item(),
+            fy=camera.fy.item(),
+            cx=camera.cx.item(),
+            cy=camera.cy.item(),
+            img_size=(
+                W,
+                H
+            ),
             c2w=torch.eye(4, dtype=torch.float, device=depth_im.device),
             device=self.device,
             smooth=False,
