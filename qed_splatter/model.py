@@ -286,11 +286,6 @@ class QEDSplatterModel(SplatfactoModel):
         rgb = render[:, ..., :3] + (1 - alpha) * background
         rgb = torch.clamp(rgb, 0.0, 1.0)
 
-        # apply bilateral grid
-        if self.config.use_bilateral_grid and self.training:
-            if camera.metadata is not None and "cam_idx" in camera.metadata:
-                rgb = self._apply_bilateral_grid(rgb, camera.metadata["cam_idx"], H, W)
-
         if render_mode == "RGB+D":
             depth_im = render[:, ..., 3:4]
             depth_im = torch.where(alpha > 0, depth_im, depth_im.detach().max()).squeeze(0)
