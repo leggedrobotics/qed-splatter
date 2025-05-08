@@ -38,7 +38,7 @@ def get_viewmat(optimized_camera_to_world):
 class QEDSplatterModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: QEDSplatterModel)
     depth_lambda: float = 0.2  # Weight for depth loss, found 0.2 to 0.3 to work well
-    random_scale: float = 100.0  # Random scale for the gaussians, set to 1 if you enable scaling
+    # random_scale: float = 100.0  # Random scale for the gaussians, set to 1 if you enable scaling
     output_depth_during_training: bool = True
 
 
