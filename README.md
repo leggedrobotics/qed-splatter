@@ -1,5 +1,7 @@
 # QED-Splatter
 QED-Splatter (short for Quick and Easy Depth Splatter) is a custom depth-supervised implementation of the Gaussian Splatting method, built on top of Nerfstudio. 
+The initial code is based on [DN-Splatter by maturk](https://github.com/maturk/dn-splatter) and hence parts of their code are used in this repository.
+Currently [some branches](https://github.com/leggedrobotics/qed-splatter/tree/normal_testing) of this repo also work with the [DN-Splatter / AGS-Mesh](https://github.com/maturk/dn-splatter) Mesh-Extraction.
 It is designed to provide a flexible and efficient framework for neural 3D scene reconstruction using depth information, particularly in outdoor and forested environments. 
 This repository was developed as part of a [Bachelor Thesis](https://github.com/leggedrobotics/forest-digital-twin) on applying Gaussian Splatting to forest environments.
 
