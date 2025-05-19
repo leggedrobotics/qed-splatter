@@ -3,7 +3,10 @@ name = "QED-Splatter"
 description = "Quick and Easy Depth Splatter"
 version = "0.1.0"
 
-dependencies = ["nerfstudio >= 1.1.0"]
+dependencies = [
+    "nerfstudio >= 1.1.0",
+    "torch",
+]
 
 [tool.setuptools.packages.find]
 include = ["qed_splatter*"]

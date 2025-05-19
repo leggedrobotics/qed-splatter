@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Type, Union, Optional, Tuple
+from typing import Dict, List, Type, Union, Optional, Tuple, Literal
 import cv2
 
 try:
@@ -19,6 +19,9 @@ import torchvision.transforms.functional as TF
 from qed_splatter.metrics import RGBMetrics, DepthMetrics
 from torch import Tensor
 from gsplat import rasterize_gaussians
+import random
+from qed_splatter.utils.knn import knn_sk
+from qed_splatter.utils.camera_utils import get_colored_points_from_depth, project_pix
 
 @torch_compile()
 def get_viewmat(optimized_camera_to_world):
@@ -153,6 +156,18 @@ def get_means3d_backproj(
     # to world coords
     means3d = means3d @ torch.linalg.inv(c2w[..., :3, :3]) + c2w[..., :3, 3]
     return means3d, image_coords
+
+def scale_rot_to_inv_cov3d(scale, quat, return_sqrt=False):
+    assert scale.shape[-1] == 3, scale.shape
+    assert quat.shape[-1] == 4, quat.shape
+    assert scale.shape[:-1] == quat.shape[:-1], (scale.shape, quat.shape)
+    scale = 1.0 / scale.clamp(min=1e-3)
+    R = quat_to_rotmat(quat)  # (..., 3, 3)
+    M = R * scale[..., None, :]  # (..., 3, 3)
+    if return_sqrt:
+        return M
+    return M @ M.transpose(-1, -2)  # (..., 3, 3)
+
 
 @dataclass
 class QEDSplatterModelConfig(SplatfactoModelConfig):
@@ -404,9 +419,9 @@ class QEDSplatterModel(SplatfactoModel):
         self.xys = self.info["means2d"]  # [1, N, 2]
         self.radii = self.info["radii"][0]  # [N]
         alpha = alpha[:, ...]
-        self.depths = info["depths"]
-        self.conics = info["conics"]
-        self.num_tiles_hit = info["tiles_per_gauss"]
+        self.depths = self.info["depths"]
+        self.conics = self.info["conics"]
+        self.num_tiles_hit = self.info["tiles_per_gauss"]
 
         background = self._get_background_color()
         rgb = render[:, ..., :3] + (1 - alpha) * background
@@ -489,3 +504,366 @@ class QEDSplatterModel(SplatfactoModel):
             "accumulation": alpha.squeeze(0),
             "background": background,
         }
+
+    def get_closest_gaussians(self, samples) -> torch.Tensor:
+        """Get closest gaussians to samples
+
+        Args:
+            samples: tensor of 3d point samples
+
+        Returns:
+            knn gaussians
+        """
+        closest_gaussians = knn_sk(
+            x=self.means.data.to("cuda"),
+            y=samples.to("cuda"),
+            k=16,
+        )
+        return closest_gaussians
+
+    def get_density(
+        self,
+        sdf_samples: Tensor,
+        closest_gaussians: Optional[Tensor] = None,
+        vis_indices: Optional[Tensor] = None,
+    ):
+        """Estimate current density at sample points based on current gaussian distributions
+
+        Args:
+            sdf_samples: current point samples
+            closest_gaussians: closest knn gaussians per current point sample
+            vis_indices: visibility mask
+
+        Returns:
+            densities
+        """
+        if closest_gaussians is None:
+            closest_gaussians = self.get_closest_gaussians(samples=sdf_samples)
+        closest_gaussians_idx = closest_gaussians
+        closest_gaussian_centers = self.means[closest_gaussians]
+
+        closest_gaussian_inv_scaled_rotation = scale_rot_to_inv_cov3d(
+            scale=torch.exp(self.scales[closest_gaussians_idx]),
+            quat=self.quats[closest_gaussians_idx],
+            return_sqrt=True,
+        )  # sigma^-1
+        closest_gaussian_opacities = torch.sigmoid(
+            self.opacities[closest_gaussians_idx]
+        )
+
+        # Compute the density field as a sum of local gaussian opacities
+        # (num_samples, knn, 3)
+        dist = sdf_samples[:, None, :] - closest_gaussian_centers
+        # (num_samples, knn, 3, 1)
+        man_distance = (
+            closest_gaussian_inv_scaled_rotation.transpose(-1, -2) @ dist[..., None]
+        )
+        # Mahalanobis distance
+        # (num_samples, knn)
+        neighbor_opacities = (
+            (man_distance[..., 0] * man_distance[..., 0])
+            .sum(dim=-1)
+            .clamp(min=0.0, max=1e8)
+        )
+        # (num_samples, knn)
+        neighbor_opacities = closest_gaussian_opacities[..., 0] * torch.exp(
+            -1.0 / 2 * neighbor_opacities
+        )
+        densities = neighbor_opacities.sum(dim=-1)  # (num_samples,)
+
+        # BUG: this seems to be quite sensitive to the EPS
+        density_mask = densities >= 1.0
+        densities[density_mask] = densities[density_mask] / (
+            densities[density_mask].detach() + 1e-5
+        )
+        opacity_min_clamp = 1e-4
+        clamped_densities = densities.clamp(min=opacity_min_clamp)
+
+        return clamped_densities
+
+    def get_sdf(
+        self,
+        sdf_samples: Tensor,
+        closest_gaussians: Optional[Tensor] = None,
+        vis_indices: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Estimate current sdf values at sample points based on current gaussian distributions
+
+        Args:
+            sdf_samples: current point samples
+            closest_gaussians: closest knn gaussians per current point sample
+            vis_indices: visibility mask
+
+        Returns:
+            sdf values
+        """
+        densities = self.get_density(
+            sdf_samples=sdf_samples,
+            closest_gaussians=closest_gaussians,
+            vis_indices=vis_indices,
+        )
+        sdf_values = 1 * torch.sqrt(-2.0 * torch.log(densities))
+        return sdf_values
+
+    @torch.no_grad()
+    def compute_level_surface_points(
+            self,
+            camera: Cameras,
+            num_samples: int,
+            mask: Optional[Tensor] = None,
+            surface_levels: Tuple[float, float, float] = (0.1, 0.3, 0.5),
+            return_normal: Literal[
+                "analytical", "closest_gaussian", "average"
+            ] = "closest_gaussian",
+    ) -> Tensor:
+        """Compute level surface intersections and their normals
+
+        Args:
+            camera: current camera object to find surface intersections
+            num_samples: number of samples per camera to target
+            mask: optional mask per camera
+            surface_levels: surface levels to compute
+            return_normal: normal return mode
+
+        Returns:
+            level surface intersection points, normals
+        """
+        c2w = camera.camera_to_worlds.squeeze(0)
+        c2w = c2w @ torch.diag(
+            torch.tensor([1, -1, -1, 1], device=c2w.device, dtype=c2w.dtype)
+        )
+        outputs = self.get_outputs(camera=camera)
+        assert "depth" in outputs
+        depth: Tensor = outputs["depth"]  # type: ignore
+        rgb: Tensor = outputs["rgb"]  # type: ignore
+        W, H = camera.width.item(), camera.height.item()
+
+        # backproject from depth map
+        points, colors = get_colored_points_from_depth(
+            depths=depth,
+            rgbs=rgb,
+            fx=camera.fx.item(),
+            fy=camera.fy.item(),
+            cx=camera.cx.item(),
+            cy=camera.cy.item(),
+            img_size=(W, H),  # img_size = (w,h)
+            c2w=c2w,
+        )
+        points = points.view(H, W, -1)  # type: ignore
+        colors = colors.view(H, W, 3)
+
+        if mask is not None:
+            mask = mask.to(points.device)
+            points = points * mask
+            depth = depth * mask
+
+        no_depth_mask = (depth <= 0.0)[..., 0]
+        points = points[~no_depth_mask]
+        colors = colors[~no_depth_mask]
+
+        # get closest gaussians
+        closest_gaussians_idx = knn_sk(self.means.data, points, k=16)
+
+        # compute gaussian stds along ray direction
+        viewdirs = -self.means.detach() + camera.camera_to_worlds.detach()[..., :3, 3]
+        viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+        quats = self.quats / self.quats.norm(dim=-1, keepdim=True)
+        inv_rots = quat_to_rotmat(invert_quaternion(quat=quats))
+        gaussian_standard_deviations = (
+                torch.exp(self.scales) * torch.bmm(inv_rots, viewdirs[..., None])[..., 0]
+        ).norm(dim=-1)
+        points_stds = gaussian_standard_deviations[closest_gaussians_idx][
+            ..., 0
+        ]  # get first closest gaussian std
+
+        range_size = 3
+        n_points_in_range = 21
+        n_points_per_pass = 2_000_000
+
+        # sampling on ray
+        points_range = (
+            torch.linspace(-range_size, range_size, n_points_in_range)
+            .to(self.device)
+            .view(1, -1, 1)
+        )  # (1, n_points_in_range, 1)
+        points_range = points_range * points_stds[..., None, None].expand(
+            -1, n_points_in_range, 1
+        )  # (n_points, n_points_in_range, 1)
+        camera_to_samples = torch.nn.functional.normalize(
+            points - camera.camera_to_worlds.detach()[..., :3, 3], dim=-1
+        )  # (n_points, 3)
+        samples = (
+                points[:, None, :] + points_range * camera_to_samples[:, None, :]
+        ).view(
+            -1, 3
+        )  # (n_points * n_points_in_range, 3)
+        samples_closest_gaussians_idx = (
+            closest_gaussians_idx[:, None, :]
+            .expand(-1, n_points_in_range, -1)
+            .reshape(-1, 16)
+        )
+
+        densities = torch.zeros(len(samples), dtype=torch.float, device=self.device)
+        gaussian_strengths = torch.sigmoid(self.opacities)
+        gaussian_centers = self.means
+        gaussian_inv_scaled_rotation = scale_rot_to_inv_cov3d(
+            scale=torch.exp(self.scales), quat=self.quats, return_sqrt=True
+        )
+
+        # compute densities along rays
+        for i in range(0, len(samples), n_points_per_pass):
+            i_start = i
+            i_end = min(len(samples), i + n_points_per_pass)
+
+            pass_closest_gaussians_idx = samples_closest_gaussians_idx[i_start:i_end]
+
+            closest_gaussian_centers = gaussian_centers[pass_closest_gaussians_idx]
+            closest_gaussian_inv_scaled_rotation = gaussian_inv_scaled_rotation[
+                pass_closest_gaussians_idx
+            ]
+
+            closest_gaussian_strengths = gaussian_strengths[pass_closest_gaussians_idx]
+            shift = samples[i_start:i_end, None] - closest_gaussian_centers
+            man_distance = (
+                    closest_gaussian_inv_scaled_rotation.transpose(-1, -2)
+                    @ shift[..., None]
+            )
+            neighbor_opacities = (
+                (man_distance[..., 0] * man_distance[..., 0])
+                .sum(dim=-1)
+                .clamp(min=0.0, max=1e8)
+            )
+            neighbor_opacities = closest_gaussian_strengths[..., 0] * torch.exp(
+                -1.0 / 2 * neighbor_opacities
+            )
+            pass_densities = neighbor_opacities.sum(dim=-1)
+
+            pass_density_mask = pass_densities >= 1.0
+            pass_densities[pass_density_mask] = pass_densities[pass_density_mask] / (
+                    pass_densities[pass_density_mask].detach() + 1e-5
+            )
+            densities[i_start:i_end] = pass_densities
+
+        densities = densities.reshape(
+            -1, n_points_in_range
+        )  # (num_samples, n_points_in_range (21))
+
+        all_outputs = {}
+        for surface_level in surface_levels:
+            outputs = {}
+
+            under_level = densities - surface_level < 0
+            above_level = densities - surface_level > 0
+
+            _, first_point_above_level = above_level.max(dim=-1, keepdim=True)
+            empty_pixels = ~under_level[..., 0] + (first_point_above_level[..., 0] == 0)
+
+            # depth as level point
+            valid_densities = densities[~empty_pixels]
+            valid_range = points_range[~empty_pixels][..., 0]
+            valid_first_point_above_level = first_point_above_level[~empty_pixels]
+
+            first_value_above_level = valid_densities.gather(
+                dim=-1, index=valid_first_point_above_level
+            ).view(-1)
+            value_before_level = valid_densities.gather(
+                dim=-1, index=valid_first_point_above_level - 1
+            ).view(-1)
+
+            first_t_above_level = valid_range.gather(
+                dim=-1, index=valid_first_point_above_level
+            ).view(-1)
+            t_before_level = valid_range.gather(
+                dim=-1, index=valid_first_point_above_level - 1
+            ).view(-1)
+
+            intersection_t = (surface_level - value_before_level) / (
+                    first_value_above_level - value_before_level
+            ) * (first_t_above_level - t_before_level) + t_before_level
+            intersection_points = (
+                    points[~empty_pixels]
+                    + intersection_t[:, None] * camera_to_samples[~empty_pixels]
+            )
+            intersection_colors = colors[~empty_pixels]
+
+            # normal
+            if return_normal == "analytical":
+                points_closest_gaussians_idx = closest_gaussians_idx[~empty_pixels]
+                closest_gaussian_centers = gaussian_centers[
+                    points_closest_gaussians_idx
+                ]
+                closest_gaussian_inv_scaled_rotation = gaussian_inv_scaled_rotation[
+                    points_closest_gaussians_idx
+                ]
+                closest_gaussian_strengths = gaussian_strengths[
+                    points_closest_gaussians_idx
+                ]
+                shift = intersection_points[:, None] - closest_gaussian_centers
+                man_distance = (
+                        closest_gaussian_inv_scaled_rotation.transpose(-1, -2)
+                        @ shift[..., None]
+                )
+                neighbor_opacities = (
+                    (man_distance[..., 0] * man_distance[..., 0])
+                    .sum(dim=-1)
+                    .clamp(min=0.0, max=1e8)
+                )
+                neighbor_opacities = closest_gaussian_strengths[..., 0] * torch.exp(
+                    -1.0 / 2 * neighbor_opacities
+                )
+                density_grad = (
+                        neighbor_opacities[..., None]
+                        * (closest_gaussian_inv_scaled_rotation @ man_distance)[..., 0]
+                ).sum(dim=-2)
+                intersection_normals = -torch.nn.functional.normalize(
+                    density_grad, dim=-1
+                )
+            elif return_normal == "closest_gaussian":
+                points_closest_gaussians_idx = closest_gaussians_idx[~empty_pixels]
+                intersection_normals = self.normals[
+                    points_closest_gaussians_idx[..., 0]
+                ]
+            else:
+                raise NotImplementedError
+
+            # sample pixels for this frame
+            assert intersection_points.shape[0] == intersection_normals.shape[0]
+            indices = random.sample(
+                range(intersection_points.shape[0]),
+                (
+                    num_samples
+                    if num_samples < intersection_points.shape[0]
+                    else intersection_points.shape[0]
+                ),
+            )
+            samples_mask = torch.tensor(indices, device=points.device)
+            intersection_points = intersection_points[samples_mask]
+            intersection_normals = intersection_normals[samples_mask]
+            intersection_colors = intersection_colors[samples_mask]
+
+            outputs["points"] = intersection_points
+            outputs["normals"] = intersection_normals
+            outputs["colors"] = intersection_colors
+            outputs["sdf"] = self.get_sdf(
+                sdf_samples=intersection_points,
+                closest_gaussians=closest_gaussians_idx[~empty_pixels][samples_mask]
+            )
+            all_outputs[surface_level] = outputs
+
+        return all_outputs
+
+    @property
+    def normals(self):
+        return self.gauss_params["normals"]
+
+def invert_quaternion(quat: Tensor):
+    """Invert quaternion in wxyz convention
+
+    Args:
+        quaternion: quat shape (..., 4), with real part first
+
+    Returns:
+        inverse quat, shape (..., 4).
+    """
+    scaling = torch.tensor([1, -1, -1, -1], device=quat.device)
+    return quat * scaling
