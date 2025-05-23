@@ -852,7 +852,7 @@ class QEDSplatterModel(SplatfactoModel):
 
         return all_outputs
 
-    @property
+    # @property
     def normals(self):
         return self.gauss_params["normals"]
 
