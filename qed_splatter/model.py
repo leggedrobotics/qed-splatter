@@ -820,7 +820,7 @@ class QEDSplatterModel(SplatfactoModel):
                 )
             elif return_normal == "closest_gaussian":
                 points_closest_gaussians_idx = closest_gaussians_idx[~empty_pixels]
-                intersection_normals = self.normals[
+                intersection_normals = self.normals()[
                     points_closest_gaussians_idx[..., 0]
                 ]
             else:
