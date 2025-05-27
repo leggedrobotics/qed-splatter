@@ -6,6 +6,29 @@ import open3d as o3d
 from open3d.t.geometry import TriangleMesh, PointCloud, Metric, MetricParameters
 import pointcloud_alignment
 
+NERFSTUDIO_TRANSFORM = np.array([
+        [
+            0.8700042963027954,
+            0.31042325496673584,
+            0.3830535113811493,
+            5.4517822265625
+        ],
+        [
+            0.31042325496673584,
+            0.2587249279022217,
+            -0.9147124290466309,
+            5.619321346282959
+        ],
+        [
+            -0.3830535113811493,
+            0.9147124290466309,
+            0.1287292242050171,
+            -4.858039855957031
+        ],
+        [0,0,0,1]
+    ]).astype(np.float64)
+NERFSTUDIO_SCALE = 0.04169970387999055
+
 def load_transforms_json(path):
     test_cam_infos = []
     train_cam_infos = []
@@ -142,45 +165,71 @@ def process_dataset(dataset_path, mesh_path):
     # metric_params)
 
     # Normalize point cloud vertices to the range [0, 1]
-    print("Normalizing point cloud vertices to the range [0, 1], original max and min are {} and {}".format(pcd.point.positions.max(), pcd.point.positions.min()))
-    pcd.point.positions = (pcd.point.positions - pcd.point.positions.min()) / (pcd.point.positions.max() - pcd.point.positions.min())
+    # print("Normalizing point cloud vertices to the range [0, 1], original max and min are {} and {}".format(pcd.point.positions.max(), pcd.point.positions.min()))
+    # pcd.point.positions = (pcd.point.positions - pcd.point.positions.min()) / (pcd.point.positions.max() - pcd.point.positions.min())
 
     # Load mesh and convert to tensor-based TriangleMesh
     mesh = o3d.t.io.read_triangle_mesh(mesh_path)
     # Normalize mesh vertices to the range [0, 1]
     mesh.vertex.positions = mesh.vertex.positions.to(o3d.core.float32)  # Convert to Float32
-    print("Normalizing mesh vertices to the range [0, 1], original max and min are {} and {}".format(mesh.vertex.positions.max(), mesh.vertex.positions.min()))
-    mesh.vertex.positions = (mesh.vertex.positions - mesh.vertex.positions.min()) / (mesh.vertex.positions.max() - mesh.vertex.positions.min())
+    print("Number of vertices in mesh: ", mesh.vertex.positions.shape[0])
+    # print("Normalizing mesh vertices to the range [0, 1], original max and min are {} and {}".format(mesh.vertex.positions.max(), mesh.vertex.positions.min()))
+    # mesh.vertex.positions = (mesh.vertex.positions - mesh.vertex.positions.min()) / (mesh.vertex.positions.max() - mesh.vertex.positions.min())
 
+    center = o3d.core.Tensor([0,0,0])
+    pcd_scaled = pcd.scale(NERFSTUDIO_SCALE, center)
+
+    # Filter out values that are too high   
+    # Define the distance threshold
+    threshold = 10.0  # Adjust this as needed
+
+    # Compute the Euclidean distance from the origin
+    print(pcd_scaled.point.positions.shape)
+    distances = np.linalg.norm(pcd_scaled.point.positions.numpy(), axis=1)
+    print(distances)
+
+    # Create a mask for points within the threshold
+    mask = distances < threshold
+
+    indices = np.where(mask)[0]
+
+    # Apply the mask to filter points
+    filtered_pcd = pcd_scaled.select_by_index(o3d.core.Tensor(indices))
     mesh_alignment_pcd = mesh.sample_points_uniformly(number_of_points=10000)  # Sample points from the mesh
 
-
     # Align the point cloud with the mesh using ICP
-    target_down, target_fpfh = pointcloud_alignment.preprocess_point_cloud(pcd, voxel_size=0.05)
+    target_down, target_fpfh = pointcloud_alignment.preprocess_point_cloud(filtered_pcd, voxel_size=0.05)
     source_down, source_fpfh = pointcloud_alignment.preprocess_point_cloud(mesh_alignment_pcd, voxel_size=0.05)
 
+    # pcd_down = filtered_pcd.voxel_down_sample(voxel_size=0.05)
     ransac_result = pointcloud_alignment.execute_global_registration(
         source_down, target_down, source_fpfh, target_fpfh, voxel_size=0.05)
     refined_result = pointcloud_alignment.refine_registration(
         source_down, target_down, source_fpfh, target_fpfh, voxel_size=0.05, ransac_result=ransac_result)
-    
-    pointcloud_alignment.draw_registration_result(source_down, target_down, refined_result.transformation)
-    
-    aligned_mesh = mesh.transform(refined_result.transformation)
 
-    # Create a raycasting scene
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(aligned_mesh)
+    print("Drawing result")
+    pointcloud_alignment.draw_registration_result(mesh_alignment_pcd, filtered_pcd, refined_result.transformation)
 
-    # Compute distances from point cloud to mesh
-    distances = scene.compute_distance(pcd.point.positions)
+    # aligned_mesh = mesh.transform(refined_result.transformation)
 
-    # Compute Chamfer Distance (mean of distances)
-    chamfer_distance = distances.mean().item()
-    print(f"Chamfer Distance: {chamfer_distance}")
+    # # Create a raycasting scene
+    # scene = o3d.t.geometry.RaycastingScene()
+    # scene.add_triangles(aligned_mesh)
 
-    # print(metrics)
-    
+    # # Compute distances from point cloud to mesh
+    # distances = scene.compute_distance(pcd.point.positions)
+
+    # # Compute Chamfer Distance (mean of distances)
+    # chamfer_distance = distances.mean().item()
+    # print(f"Chamfer Distance: {chamfer_distance}")
+
+    aligned_mesh_pcd = mesh_alignment_pcd.transform(refined_result.transformation)
+    metric_params = MetricParameters()
+    metrics = aligned_mesh_pcd.compute_metrics(
+        filtered_pcd, [Metric.ChamferDistance],
+    metric_params)
+
+    print("Chamfer Distance ", metrics)
 
 def main():
     parser = argparse.ArgumentParser(description="Process a dataset.")

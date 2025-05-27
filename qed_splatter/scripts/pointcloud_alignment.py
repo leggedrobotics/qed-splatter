@@ -31,6 +31,12 @@ def preprocess_point_cloud(pcd, voxel_size):
         o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
     return pcd_down, pcd_fpfh
 
+criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
+    max_iteration=100,      # Increase the number of iterations
+    relative_fitness=1e-6,   # How much fitness should change to continue iterating
+    relative_rmse=1e-6       # How much the RMSE should change to continue iterating
+)
+
 def execute_global_registration(source_down, target_down, source_fpfh,
                                 target_fpfh, voxel_size):
     distance_threshold = voxel_size * 1.5
@@ -38,7 +44,7 @@ def execute_global_registration(source_down, target_down, source_fpfh,
     print("   Since the downsampling voxel size is %.3f," % voxel_size)
     print("   we use a liberal distance threshold %.3f." % distance_threshold)
     result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
-        source_down.to_legacy(), target_down.to_legacy(), source_fpfh, target_fpfh, True, distance_threshold,
+        source_down.to_legacy(), target_down.to_legacy(), source_fpfh, target_fpfh, False, distance_threshold,
         o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
         4, [
             o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(
@@ -49,13 +55,14 @@ def execute_global_registration(source_down, target_down, source_fpfh,
     return result
 
 def refine_registration(source, target, source_fpfh, target_fpfh, voxel_size, ransac_result):
-    distance_threshold = voxel_size * 0.4
+    distance_threshold = voxel_size * 1.0
     print(":: Point-to-plane ICP registration is applied on original point")
     print("   clouds to refine the alignment. This time we use a strict")
     print("   distance threshold %.3f." % distance_threshold)
     result = o3d.pipelines.registration.registration_icp(
         source.to_legacy(), target.to_legacy(), distance_threshold, ransac_result.transformation,
-        o3d.pipelines.registration.TransformationEstimationPointToPlane())
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        criteria=criteria)
     return result
 
 def execute_fast_global_registration(source_down, target_down, source_fpfh,
