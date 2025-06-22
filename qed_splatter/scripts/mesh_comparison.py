@@ -3,30 +3,8 @@ import os
 import json
 import numpy as np
 import open3d as o3d
-from open3d.t.geometry import TriangleMesh, PointCloud, Metric, MetricParameters
+from open3d.t.geometry import Metric, MetricParameters
 import pointcloud_alignment
-
-NERFSTUDIO_TRANSFORM = np.array([
-        [
-            0.8700042963027954,
-            0.31042325496673584,
-            0.3830535113811493,
-            5.4517822265625
-        ],
-        [
-            0.31042325496673584,
-            0.2587249279022217,
-            -0.9147124290466309,
-            5.619321346282959
-        ],
-        [
-            -0.3830535113811493,
-            0.9147124290466309,
-            0.1287292242050171,
-            -4.858039855957031
-        ],
-        [0,0,0,1]
-    ]).astype(np.float64)
 
 def load_transforms_json(path):
     test_cam_infos = []
@@ -37,22 +15,6 @@ def load_transforms_json(path):
         fovx = 2 * np.arctan(contents["w"] / (2 * contents["fl_x"]))
 
         frames = contents["frames"]
-
-        # find train and eval indices based on the eval_mode specified
-        # eval_mode = "fraction"
-        # if eval_mode == "fraction":
-        #     i_train, i_eval = get_train_eval_split_fraction(frames, train_split_fraction=0.9)
-        # elif eval_mode == "filename":
-        #     i_train, i_eval = get_train_eval_split_filename(frames)
-        # elif eval_mode == "interval":
-        #     i_train, i_eval = get_train_eval_split_interval(frames, eval_interval=8)
-        # elif eval_mode == "all":
-        #     print(
-        #         "[yellow] Be careful with '--eval-mode=all'. If using camera optimization, the cameras may diverge in the current implementation, giving unpredictable results."
-        #     )
-        #     i_train, i_eval = get_train_eval_split_all(frames)
-        # else:
-        #     raise ValueError(f"Unknown eval mode {eval_mode}")
 
         # Convert to set for faster evaluation
         pointcloud = o3d.t.geometry.PointCloud()
@@ -71,22 +33,6 @@ def load_transforms_json(path):
             R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
             T = w2c[:3, 3]
 
-            # image_path = os.path.join(path, cam_name)
-            # image_name = Path(cam_name).stem
-            # image = Image.open(image_path)
-
-            # im_data = np.array(image.convert("RGBA"))
-
-            # bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
-
-            # norm_data = im_data / 255.0
-            # arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            # image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
-
-            # fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            # FovY = fovy 
-            # FovX = fovx
-
             invdepthmap=None
             depth_path = os.path.join(path, frame["depth_file_path"])
             invdepthmap = np.load(depth_path).astype(np.float32) # load in m
@@ -94,15 +40,6 @@ def load_transforms_json(path):
             # Mask out NaN and infinite values
             mask = np.isfinite(invdepthmap)
             valid_pixels = invdepthmap[mask]
-
-            # Normalize only valid pixels
-            # if valid_pixels.size > 0:
-            #     min_val = np.min(valid_pixels)
-            #     max_val = np.max(valid_pixels)
-            #     normalized = np.zeros_like(invdepthmap, dtype=np.float32)
-            #     normalized[mask] = ((invdepthmap[mask] - min_val) / (max_val - min_val)).astype(np.float32)
-            # else:
-            #     normalized = np.zeros_like(invdepthmap, dtype=np.float32)
 
             invdepthmap = np.ascontiguousarray(invdepthmap)
 
@@ -123,13 +60,6 @@ def load_transforms_json(path):
             )
 
             pointcloud += pointcloud_from_depth
-
-            # if idx in i_train:
-            #     train_cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image, invdepthmap=invdepthmap,
-            #         image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
-            # elif idx in i_eval:
-            #     test_cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image, invdepthmap=invdepthmap,
-            #         image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
             
         pointcloud = pointcloud.voxel_down_sample(voxel_size=0.05)  # Adjust voxel size as needed
         return pointcloud
@@ -154,14 +84,6 @@ def process_dataset(dataset_path, mesh_path, nerfstudio_scale):
             print(f"Saved point cloud to {os.path.join(dataset_path, 'gt_pointcloud.ply')}")
         else:
             raise ValueError("Unable to generate gt_pointgloud.ply. Unsupported dataset format or missing transforms.json file.")
-        
-    # model_pcd = o3d.t.io.read_point_cloud(mesh_path)
-    # model_pcd.point.positions = model_pcd.point.positions.to(o3d.core.float32)  # Convert to Float32
-
-    # metric_params = MetricParameters()
-    # metrics = pcd.compute_metrics(
-    #     model_pcd, [Metric.ChamferDistance],
-    # metric_params)
 
     # Normalize point cloud vertices to the range [0, 1]
     # print("Normalizing point cloud vertices to the range [0, 1], original max and min are {} and {}".format(pcd.point.positions.max(), pcd.point.positions.min()))
@@ -206,19 +128,6 @@ def process_dataset(dataset_path, mesh_path, nerfstudio_scale):
 
     print("Drawing result")
     pointcloud_alignment.draw_registration_result(mesh_alignment_pcd, filtered_pcd, refined_result.transformation)
-
-    # aligned_mesh = mesh.transform(refined_result.transformation)
-
-    # # Create a raycasting scene
-    # scene = o3d.t.geometry.RaycastingScene()
-    # scene.add_triangles(aligned_mesh)
-
-    # # Compute distances from point cloud to mesh
-    # distances = scene.compute_distance(pcd.point.positions)
-
-    # # Compute Chamfer Distance (mean of distances)
-    # chamfer_distance = distances.mean().item()
-    # print(f"Chamfer Distance: {chamfer_distance}")
 
     aligned_mesh_pcd = mesh_alignment_pcd.transform(refined_result.transformation)
     metric_params = MetricParameters()
