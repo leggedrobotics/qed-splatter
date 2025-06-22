@@ -27,7 +27,6 @@ NERFSTUDIO_TRANSFORM = np.array([
         ],
         [0,0,0,1]
     ]).astype(np.float64)
-NERFSTUDIO_SCALE = 0.04169970387999055
 
 def load_transforms_json(path):
     test_cam_infos = []
@@ -135,7 +134,7 @@ def load_transforms_json(path):
         pointcloud = pointcloud.voxel_down_sample(voxel_size=0.05)  # Adjust voxel size as needed
         return pointcloud
 
-def process_dataset(dataset_path, mesh_path):
+def process_dataset(dataset_path, mesh_path, nerfstudio_scale):
     """Reads and processes the dataset."""
     
     if os.path.exists(os.path.join(dataset_path, "gt_pointcloud.ply")):
@@ -143,7 +142,7 @@ def process_dataset(dataset_path, mesh_path):
         pcd = o3d.t.io.read_point_cloud(os.path.join(dataset_path, "gt_pointcloud.ply"))
         pcd.point.positions = pcd.point.positions.to(o3d.core.float32)  # Convert to Float32
         
-        print(f"Loaded point cloud with {pcd.point.positions.shape[0]} points.")
+        print(f"Loaded gt point cloud with {pcd.point.positions.shape[0]} points.")
     else:
         print("No gt_pointcloud.ply file found, generating...")
         if os.path.exists(os.path.join(dataset_path, "transforms.json")):
@@ -177,16 +176,14 @@ def process_dataset(dataset_path, mesh_path):
     # mesh.vertex.positions = (mesh.vertex.positions - mesh.vertex.positions.min()) / (mesh.vertex.positions.max() - mesh.vertex.positions.min())
 
     center = o3d.core.Tensor([0,0,0])
-    pcd_scaled = pcd.scale(NERFSTUDIO_SCALE, center)
+    pcd_scaled = pcd.scale(nerfstudio_scale, center)
 
     # Filter out values that are too high   
     # Define the distance threshold
     threshold = 10.0  # Adjust this as needed
 
     # Compute the Euclidean distance from the origin
-    print(pcd_scaled.point.positions.shape)
     distances = np.linalg.norm(pcd_scaled.point.positions.numpy(), axis=1)
-    print(distances)
 
     # Create a mask for points within the threshold
     mask = distances < threshold
@@ -235,8 +232,9 @@ def main():
     parser = argparse.ArgumentParser(description="Process a dataset.")
     parser.add_argument("--data", required=True, help="Path to the dataset")
     parser.add_argument("--mesh", required=True, help="Path to the mesh to evaluate")
+    parser.add_argument("--nerfstudio-scale", type=float, default=0.04169970387999055, help="The scaling factor used in the generation of the mesh by nerfstudio. Default is 0.04169970387999055.")
     args = parser.parse_args()
-    process_dataset(args.data, args.mesh)
+    process_dataset(args.data, args.mesh, args.nerfstudio_scale)
 
 if __name__ == "__main__":
     main()
