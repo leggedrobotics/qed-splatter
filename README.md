@@ -35,9 +35,12 @@ ns-train qed-splatter --data [PATH]
 
 ## Pruning Extension
 
+The pruning extension provides tools to reduce the number of Gaussians to increase the rendering speed. There are two main types of pruner available. Soft pruner reduce the number of Gaussians during training. Hard pruner are a post processing tool which can be used after training. Each pruner computes a pruning score to rank the importance of Gaussians. The least important are pruned.
+
 Currently two scripts are usable:
 
 ### RGB_hard_pruner
+This pruner uses RGB loss to compute a pruning score to do hard pruning.
 ```
 python3 RGB_hard_pruner.py default --data-dir datasets/park --ckpt results/park/step-000029999.ckpt --pruning-ratio 0.1 --result-dir output
 
@@ -46,15 +49,13 @@ python3 RGB_hard_pruner.py default --data-dir datasets/park --ckpt results/park/
 --output-format (ply (default), ckpt (nerfstudio), pt (gsplat))
 ```
 ### depth_hard_pruner
-
-Works analogously to the RGB hard pruner, not all features are available.
+This pruner uses depth loss to compute a pruning score to do hard pruning. It works analogously to the RGB hard pruner but not all features are available.
 
 ### Soft Pruner (WIP)
-
-To use the soft pruner during qed traing use the following command:
+This pruner also uses RGB loss to compute the pruning score. To use the soft pruner during qed traing use the following command:
 ```
 PRUNING_RATIO=0.2 SOFT_PRUNING=True DATA_DIR=<data> ns-train qed-splatter --data <data>
 ```
-#### known issues
-The current sof pruner uses ENV variables. This will be adressed later.
+#### Known Issues
+The current soft pruner uses ENV variables. This will be adressed later.
 For the Park scene it tries to generate black gaussians to cover the sky. The enitre scene is encased in these gaussians.
