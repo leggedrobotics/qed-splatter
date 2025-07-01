@@ -102,6 +102,13 @@ This file must include the following:
 }
 ```
 
+## Input Format
+
+The code supports multiple output formats. The format is detected automatically. 
+- `ply` : expects a Nerfstudio format for the transforms. 
+- `ckpt` : expects a Nerfstudio format for the transforms. 
+- `pt` : expects a gsplat format for the transforms. 
+
 
 ### Depth_hard_pruner
 This pruner uses depth loss to compute a pruning score to do hard pruning. It works analogously to the RGB hard pruner but not all features are available.
