@@ -30,9 +30,5 @@ RUN mkdir -p /root/.cache/torch/hub/checkpoints && \
     wget https://download.pytorch.org/models/alexnet-owt-7be5be79.pth \
          -O /root/.cache/torch/hub/checkpoints/alexnet-owt-7be5be79.pth
 
-# Modify gsplat to handle softpruning
-COPY soft_pruning_tweeks/default.py /usr/local/lib/python3.10/dist-packages/gsplat/strategy/default.py
-COPY soft_pruning_tweeks/soft_prune_utils /usr/local/lib/python3.10/dist-packages/gsplat/strategy/soft_prune_utils
-
 # Set working directory
 WORKDIR /workspace

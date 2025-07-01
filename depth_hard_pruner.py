@@ -15,9 +15,9 @@ import tqdm
 import tyro
 import viser
 import yaml
-from soft_pruning_tweeks.soft_prune_utils.nerf import NerfDataset , NerfParser
-from soft_pruning_tweeks.soft_prune_utils.colmap import Dataset, Parser
-from soft_pruning_tweeks.soft_prune_utils.traj import (
+from pruning_utils.nerf import NerfDataset , NerfParser
+from pruning_utils.colmap import Dataset, Parser
+from pruning_utils.traj import (
     generate_interpolated_path,
     generate_ellipse_path_z,
     generate_spiral_path,
@@ -29,14 +29,14 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from fused_ssim import fused_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from soft_pruning_tweeks.soft_prune_utils.utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
-from soft_pruning_tweeks.soft_prune_utils.lib_bilagrid import (
+from pruning_utils.utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from pruning_utils.lib_bilagrid import (
     BilateralGrid,
     slice,
     color_correct,
     total_variation_loss,
 )
-from soft_pruning_tweeks.soft_prune_utils.open_ply_pipeline import load_splats, save_splats
+from pruning_utils.open_ply_pipeline import load_splats, save_splats
 
 
 from gsplat.compression import PngCompression

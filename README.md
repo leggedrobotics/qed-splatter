@@ -57,11 +57,6 @@ python3 depth_hard_pruner.py default --data-dir datasets/park --ckpt results/par
 --pruning-ratio 0.0 (no pruning, saved in new format)  
 --output-format (ply (default), ckpt (nerfstudio), pt (gsplat))
 ```
-### Soft Pruner (WIP)
-This pruner also uses RGB loss to compute the pruning score. To use the soft pruner during qed traing use the following command:
-```
-PRUNING_RATIO=0.2 SOFT_PRUNING=True DATA_DIR=<data> ns-train qed-splatter --data <data>
-```
+
 #### Known Issues
-The current soft pruner uses ENV variables. This will be adressed later.
 For the Park scene it tries to generate black gaussians to cover the sky. The enitre scene is encased in these gaussians.
