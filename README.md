@@ -48,6 +48,61 @@ python3 RGB_hard_pruner.py default --data-dir datasets/park --ckpt results/park/
 --pruning-ratio 0.0 (no pruning, saved in new format)  
 --output-format (ply (default), ckpt (nerfstudio), pt (gsplat))
 ```
+
+## 📥 Required Arguments
+
+| Argument          | Description                                                                 |
+|-------------------|-----------------------------------------------------------------------------|
+| `default`         | Specifies the run configuration.   |
+| `--data-dir`      | Path to the directory containing `transforms.json` (camera poses and intrinsics) and images (RGB, Depth)· |
+| `--ckpt`          | Path to the pretrained model checkpoint (e.g., `results/park/step-XXXXX.ckpt`). |
+| `--pruning-ratio` | Float between `0.0` and `1.0`. Proportion of the model to prune. Example: `0.1` = keep 90%. |
+| `--result-dir`    | Directory where the output (pruned model) will be saved.                |
+
+
+### 🔧 `transforms.json` File
+
+This file must include the following:
+
+- Intrinsic camera parameters:
+  - `"fl_x"`, `"fl_y"`: focal lengths
+  - `"cx"`, `"cy"`: principal point
+  - `"w"`, `"h"`: image dimensions
+
+- A list of frames, each containing:
+  - `file_path`: path to the RGB image (relative to `your_dataset/`)
+  - `depth_file_path`: path to the depth map (relative to `your_dataset/`)
+  - `transform_matrix`: 4x4 camera-to-world matrix
+
+**Example:**
+```json
+{
+    "w": 1920,
+    "h": 1080,
+    "fl_x": 2198.997802734375,
+    "fl_y": 2198.997802734375,
+    "cx": 960.0,
+    "cy": 540.0,
+    "k1": 0,
+    "k2": 0,
+    "p1": 0,
+    "p2": 0,
+  "frames": [
+    {
+      "file_path": "images/frame_0000.png",
+      "depth_file_path": "depths/frame_0000.png",
+      "transform_matrix": [[1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,0,1]]
+    },
+    {
+      "file_path": "images/frame_0001.png",
+      "depth_file_path": "depths/frame_0001.png",
+      "transform_matrix": [[0,2,0,0], [0,1,3,0], [0,0,1,0], [0,5,0,1]]
+    }
+  ]
+}
+```
+
+
 ### Depth_hard_pruner
 This pruner uses depth loss to compute a pruning score to do hard pruning. It works analogously to the RGB hard pruner but not all features are available.
 ```
