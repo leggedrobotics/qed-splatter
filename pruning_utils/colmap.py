@@ -1,3 +1,14 @@
+"""
+===========================================================================
+Unmodified code from gsplat examples
+Original source:
+https://github.com/nerfstudio-project/gsplat/blob/main/examples/datasets/colmap.py :contentReference[oaicite:0]{index=0}
+License: Apache License 2.0
+----------------------------------------------------------------------------
+This file was copied verbatim from the gsplat repository. No modifications were made.
+===========================================================================
+"""
+
 import os
 import json
 from typing import Any, Dict, List, Optional

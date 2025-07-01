@@ -1,7 +1,7 @@
 import os
 import json
 import torch
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 import imageio.v2 as imageio
 import numpy as np
 import cv2
@@ -10,7 +10,6 @@ from .normalize import (
     align_principle_axes,
     similarity_from_cameras,
     transform_cameras,
-    transform_points,
 )
 
 
@@ -21,13 +20,7 @@ def convert_opengl_to_colmap(R):
 
 class NerfParser:
     """NeRF Studio parser (transforms.json)."""
-
-    
-
-
     def __init__(self, data_dir: str, factor: int = 1, normalize: bool = False, test_every: int = 8):
-
-
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
@@ -45,11 +38,8 @@ class NerfParser:
         image_paths = []
         depth_paths = []
 
-        Ks_dict = {}
-        imsize_dict = {}
         camera_ids = []
         image_names = []
-        mask_dict = {}
 
         fl_x = meta["fl_x"]
         fl_y = meta["fl_y"]
@@ -235,12 +225,5 @@ class NerfDataset:
 
             data["depth"] = torch.from_numpy(depth).float()
             
-
-
-
-
-            
-
-
         return data
 

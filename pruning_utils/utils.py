@@ -1,3 +1,14 @@
+"""
+===========================================================================
+Unmodified code from gsplat examples
+Original source:
+https://github.com/nerfstudio-project/gsplat/blob/main/examples/utils.py
+License: Apache License 2.0
+----------------------------------------------------------------------------
+This file was copied verbatim from the gsplat repository. No modifications were made.
+===========================================================================
+"""
+
 import random
 
 import numpy as np

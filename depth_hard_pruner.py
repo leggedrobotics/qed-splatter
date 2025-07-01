@@ -1,9 +1,8 @@
-import json
+
 import math
 import os
 import time
 from dataclasses import dataclass, field
-from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import imageio
@@ -14,7 +13,7 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
-import yaml
+
 from pruning_utils.nerf import NerfDataset , NerfParser
 from pruning_utils.colmap import Dataset, Parser
 from pruning_utils.traj import (
@@ -29,12 +28,9 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from fused_ssim import fused_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from pruning_utils.utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from pruning_utils.utils import AppearanceOptModule, CameraOptModule, set_random_seed
 from pruning_utils.lib_bilagrid import (
     BilateralGrid,
-    slice,
-    color_correct,
-    total_variation_loss,
 )
 from pruning_utils.open_ply_pipeline import load_splats, save_splats
 
@@ -197,7 +193,7 @@ class Runner:
     """Engine for training and testing."""
 
     def __init__(
-        self, local_rank: int, world_rank, world_size: int, cfg: Config
+        self, local_rank: int, world_rank: int, world_size: int, cfg: Config
     ) -> None:
         set_random_seed(42 + local_rank)
 

@@ -1,4 +1,3 @@
-import json
 import math
 import os
 import time
@@ -14,7 +13,6 @@ import torch.nn.functional as F
 import tqdm
 import tyro
 import viser
-import yaml
 from pruning_utils.nerf import NerfDataset , NerfParser
 from pruning_utils.colmap import Dataset, Parser
 from pruning_utils.traj import (
@@ -29,12 +27,10 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from fused_ssim import fused_ssim
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from pruning_utils.utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from pruning_utils.utils import AppearanceOptModule, CameraOptModule, set_random_seed
 from pruning_utils.lib_bilagrid import (
     BilateralGrid,
-    slice,
     color_correct,
-    total_variation_loss,
 )
 from pruning_utils.open_ply_pipeline import load_splats, save_splats
 
@@ -199,7 +195,7 @@ class Runner:
     """Engine for training and testing."""
 
     def __init__(
-        self, local_rank: int, world_rank, world_size: int, cfg: Config
+        self, local_rank: int, world_rank: int, world_size: int, cfg: Config
     ) -> None:
         set_random_seed(42 + local_rank)
 
@@ -264,22 +260,14 @@ class Runner:
         # Model
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = self.create_splats_with_optimizers(
-            self.parser,
-            init_type=cfg.init_type,
-            init_num_pts=cfg.init_num_pts,
-            init_extent=cfg.init_extent,
-            init_opacity=cfg.init_opa,
-            init_scale=cfg.init_scale,
             scene_scale=self.scene_scale,
-            sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
             batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
             device=self.device,
-            world_rank=world_rank,
             world_size=world_size,
             cfg=self.cfg,
         )
+
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
@@ -388,19 +376,10 @@ class Runner:
 
     def create_splats_with_optimizers(
         self,
-        parser: Parser,
-        init_type: str = "sfm",
-        init_num_pts: int = 100_000,
-        init_extent: float = 3.0,
-        init_opacity: float = 0.1,
-        init_scale: float = 1.0,
         scene_scale: float = 1.0,
-        sh_degree: int = 3,
         sparse_grad: bool = False,
         batch_size: int = 1,
-        feature_dim: Optional[int] = None,
         device: str = "cuda",
-        world_rank: int = 0,
         world_size: int = 1,
         cfg: Optional[List[str]] = None,
     ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
@@ -452,7 +431,6 @@ class Runner:
     def reinit_optimizers(self):
         """Reinitialize optimizers after pruning Gaussians."""
         print("Reinitializing optimizers after pruning...")
-        device = self.device
         cfg = self.cfg
         BS = cfg.batch_size * self.world_size
 
@@ -485,7 +463,7 @@ class Runner:
         self.optimizers = new_optimizers
 
 
-    def prune_gaussians(self, prune_ratio: float, scores):
+    def prune_gaussians(self, prune_ratio: float, scores: torch.Tensor):
         """Prune Gaussians based on score thresholding."""
         num_prune = int(len(scores) * prune_ratio)
         _, idx = torch.topk(scores.squeeze(), k=num_prune, largest=False)
@@ -512,8 +490,12 @@ class Runner:
 
 
     @torch.enable_grad()
-    def score_func(self, viewpoint_cam, scores, mask_views):
-        img_scores = torch.zeros_like(scores, requires_grad=True)
+    def score_func(
+        self,
+        viewpoint_cam: Dict[str, torch.Tensor],
+        scores: torch.Tensor,
+        mask_views: torch.Tensor
+    ) -> None:
 
         # Get camera matrices without extra dimensions
         camtoworld = viewpoint_cam["camtoworld"].to(self.device)  # shape: [4, 4]
@@ -575,7 +557,6 @@ class Runner:
     @torch.no_grad()
     def prune(self, prune_ratio: float):
         print("Running pruning...")
-        device = self.device
         scores = torch.zeros_like(self.splats["opacities"])
         mask_views = torch.zeros_like(self.splats["opacities"])
 
@@ -669,7 +650,6 @@ class Runner:
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
-        world_size = self.world_size
 
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
@@ -735,13 +715,7 @@ class Runner:
                 f"Time: {stats['ellipse_time']:.3f}s/image "
                 f"Number of GS: {stats['num_GS']}"
             )
-            # save stats as json
-            # with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
-            #     json.dump(stats, f)
-            # # save stats to tensorboard
-            # for k, v in stats.items():
-            #     self.writer.add_scalar(f"{stage}/{k}", v, step)
-            # self.writer.flush()
+ 
 
 
     @torch.no_grad()

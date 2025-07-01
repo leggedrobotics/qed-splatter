@@ -1,9 +1,13 @@
 import torch
 from pyntcloud import PyntCloud
+from typing import Dict, Union, Literal, Optional
 import os
 import pandas as pd
 
-def load_splats(path, device='cpu'):
+def load_splats(
+    path: str,
+    device: Union[str, torch.device] = 'cpu'
+) -> Dict[str, torch.nn.Parameter]:
     """
     Load splat data from a .ply or .ckpt file.
 
@@ -125,14 +129,12 @@ def load_splats(path, device='cpu'):
 
 
 
-
-
-import torch
-import pandas as pd
-from pyntcloud import PyntCloud
-
-
-def save_splats(path, data, file_type='ply', step_value=None):
+def save_splats(
+    path: str,
+    data: Dict[str, Union[Dict[str, torch.nn.Parameter], int]],
+    file_type: Literal['ply', 'pt', 'ckpt'] = 'ply',
+    step_value: Optional[int] = None
+) -> None:
     """
     Export splat data to .ply, .pt, or .ckpt format.
     
@@ -188,7 +190,12 @@ def save_splats(path, data, file_type='ply', step_value=None):
         _save_ckpt_from_splats(None, path + ".ckpt", step_value, direct_data=data)
 
 
-def _save_ckpt_from_splats(pt_path, save_path, step_value, direct_data=None):
+def _save_ckpt_from_splats(
+    pt_path: str,
+    save_path: str,
+    step_value: int,
+    direct_data: Optional[Dict[str, Dict[str, torch.nn.Parameter]]] = None
+) -> None:
     """Internal helper to convert .pt or dict to .ckpt."""
     device = torch.device("cpu")
 
