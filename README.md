@@ -48,7 +48,7 @@ python3 RGB_hard_pruner.py default --data-dir datasets/park --ckpt results/park/
 --pruning-ratio 0.0 (no pruning, saved in new format)  
 --output-format (ply (default), ckpt (nerfstudio), pt (gsplat))
 ```
-### depth_hard_pruner
+### Depth_hard_pruner
 This pruner uses depth loss to compute a pruning score to do hard pruning. It works analogously to the RGB hard pruner but not all features are available.
 
 ### Soft Pruner (WIP)
