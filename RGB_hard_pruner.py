@@ -1,3 +1,10 @@
+"""
+RGB hard pruning Script
+
+Part of this code is based on gsplat’s `simple_trainer.py`:
+https://github.com/nerfstudio-project/gsplat/blob/main/examples/simple_trainer.py
+
+"""
 import math
 import os
 import time
@@ -59,11 +66,11 @@ class Config:
     # Output data format converted
     output_format: str = "ply"    
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: str = "data"
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
-    result_dir: str = "results/garden"
+    result_dir: str = "./results"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -90,12 +97,6 @@ class Config:
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
 
-    # Initialization strategy
-    init_type: str = "sfm"
-    # Initial number of GSs. Ignored if using sfm
-    init_num_pts: int = 100_000
-    # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
-    init_extent: float = 3.0
     # Degree of spherical harmonics
     sh_degree: int = 3
     # Turn on another SH degree every this steps
@@ -126,8 +127,6 @@ class Config:
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
 
-    # Use random background for training to discourage transparency
-    random_bkgd: bool = False
 
     # Opacity regularization
     opacity_reg: float = 0.0
@@ -159,13 +158,6 @@ class Config:
 
     # Enable depth loss. (experimental)
     depth_loss: bool = False
-    # Weight for depth loss
-    depth_lambda: float = 1e-2
-
-    # Dump information to tensorboard every this steps
-    tb_every: int = 100
-    # Save training images to tensorboard
-    tb_save_image: bool = False
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 
@@ -430,7 +422,6 @@ class Runner:
 
     def reinit_optimizers(self):
         """Reinitialize optimizers after pruning Gaussians."""
-        print("Reinitializing optimizers after pruning...")
         cfg = self.cfg
         BS = cfg.batch_size * self.world_size
 
@@ -469,15 +460,6 @@ class Runner:
         _, idx = torch.topk(scores.squeeze(), k=num_prune, largest=False)
         mask = torch.ones_like(scores, dtype=torch.bool)
         mask[idx] = False
-        # Prune splats
-        # pruned_splats = {}
-        # for name in self.splats:
-        #     pruned_splats[name] = self.splats[name].data[mask]
-
-        # # Replace splats with pruned ones
-        # self.splats = torch.nn.ParameterDict({
-        #     k: torch.nn.Parameter(v.clone()) for k, v in pruned_splats.items()
-        # })
         
         remove(
             params=self.splats,
@@ -573,13 +555,8 @@ class Runner:
             self.score_func(data, scores, mask_views)
             pbar.update(1)
 
-        print("the mask is : ", mask_views)
         np.savetxt('mask_views_full.txt', mask_views.cpu().numpy(), fmt='%.18e')
         np.savetxt('scores_txt.txt', scores.cpu().numpy(), fmt='%.18e')
-
-
-
-        # scores = scores / (mask_views**10 + 1)
 
         # Prune Gaussians
         self.prune_gaussians(prune_ratio, scores)
@@ -596,8 +573,6 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
@@ -878,18 +853,6 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
 
 
 if __name__ == "__main__":
-    """
-    Usage:
-
-    ```bash
-    # Single GPU training
-    CUDA_VISIBLE_DEVICES=0 python simple_trainer.py default
-
-    # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
-
-    """
-
     # Config objects we can choose between.
     # Each is a tuple of (CLI description, config object).
     configs = {

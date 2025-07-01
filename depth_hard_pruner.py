@@ -1,3 +1,11 @@
+"""
+Depth hard pruning Script
+
+Part of this code is based on gsplat’s `simple_trainer.py`:
+https://github.com/nerfstudio-project/gsplat/blob/main/examples/simple_trainer.py
+
+"""
+
 
 import math
 import os
@@ -60,11 +68,11 @@ class Config:
     # Output data format converted
     output_format: str = "ply"    
     # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    data_dir: str = "data"
     # Downsample factor for the dataset
     data_factor: int = 4
     # Directory to save results
-    result_dir: str = "results/garden"
+    result_dir: str = "./results"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -124,9 +132,6 @@ class Config:
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
 
-    # Use random background for training to discourage transparency
-    random_bkgd: bool = False
-
     # Opacity regularization
     opacity_reg: float = 0.0
     # Scale regularization
@@ -157,13 +162,6 @@ class Config:
 
     # Enable depth loss. (experimental)
     depth_loss: bool = True
-    # Weight for depth loss
-    depth_lambda: float = 1e-2
-
-    # Dump information to tensorboard every this steps
-    tb_every: int = 100
-    # Save training images to tensorboard
-    tb_save_image: bool = False
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 
@@ -258,19 +256,10 @@ class Runner:
         # Model
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = self.create_splats_with_optimizers(
-            self.parser,
-            init_type=cfg.init_type,
-            init_num_pts=cfg.init_num_pts,
-            init_extent=cfg.init_extent,
-            init_opacity=cfg.init_opa,
-            init_scale=cfg.init_scale,
             scene_scale=self.scene_scale,
-            sh_degree=cfg.sh_degree,
             sparse_grad=cfg.sparse_grad,
             batch_size=cfg.batch_size,
-            feature_dim=feature_dim,
             device=self.device,
-            world_rank=world_rank,
             world_size=world_size,
             cfg=self.cfg,
         )
@@ -382,19 +371,10 @@ class Runner:
 
     def create_splats_with_optimizers(
         self,
-        parser: Parser,
-        init_type: str = "sfm",
-        init_num_pts: int = 100_000,
-        init_extent: float = 3.0,
-        init_opacity: float = 0.1,
-        init_scale: float = 1.0,
         scene_scale: float = 1.0,
-        sh_degree: int = 3,
         sparse_grad: bool = False,
         batch_size: int = 1,
-        feature_dim: Optional[int] = None,
         device: str = "cuda",
-        world_rank: int = 0,
         world_size: int = 1,
         cfg: Optional[List[str]] = None,
     ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
@@ -445,8 +425,6 @@ class Runner:
 
     def reinit_optimizers(self):
         """Reinitialize optimizers after pruning Gaussians."""
-        print("Reinitializing optimizers after pruning...")
-        device = self.device
         cfg = self.cfg
         BS = cfg.batch_size * self.world_size
 
@@ -479,7 +457,7 @@ class Runner:
         self.optimizers = new_optimizers
 
 
-    def prune_gaussians(self, prune_ratio: float, scores):
+    def prune_gaussians(self, prune_ratio: float, scores: torch.Tensor):
         """Prune Gaussians based on score thresholding."""
         reduced_scores = scores.mean(dim=1)
 
@@ -489,16 +467,7 @@ class Runner:
         _, idx = torch.topk(reduced_scores, k=num_prune, largest=False)
         mask = torch.ones_like(reduced_scores, dtype=torch.bool)
         mask[idx] = False
-        # Prune splats
-        # pruned_splats = {}
-        # for name in self.splats:
-        #     pruned_splats[name] = self.splats[name].data[mask]
 
-        # # Replace splats with pruned ones
-        # self.splats = torch.nn.ParameterDict({
-        #     k: torch.nn.Parameter(v.clone()) for k, v in pruned_splats.items()
-        # })
-        
         remove(
             params=self.splats,
             optimizers= self.optimizers,
@@ -557,15 +526,17 @@ class Runner:
 
         # Save to disk
         combined_img.save(filename)
-        # print(f"Saved comparison image to '{new_filename}'")
 
         return rendered_image, target_image
 
 
     @torch.enable_grad()
-    def score_func(self, viewpoint_cam, scores, mask_views):
-        img_scores = torch.zeros_like(scores, requires_grad=True)
-
+    def score_func(
+        self,
+        viewpoint_cam: Dict[str, torch.Tensor],
+        scores: torch.Tensor,
+        mask_views: torch.Tensor
+    ) -> None:
 
         # Get camera matrices without extra dimensions
         camtoworld = viewpoint_cam["camtoworld"].to(self.device)  # shape: [4, 4]
@@ -586,29 +557,9 @@ class Runner:
         # Compute loss
         rendered_depth = render[..., 3:4]
 
-        # print("testing index : ", viewpoint_cam["image_id"])
-
         image_depth = self.trainset[viewpoint_cam["image_id"].item()]["depth"].to(self.device)[None].unsqueeze(-1)
 
-        # print("the id is : ", viewpoint_cam["image_id"])
-        # print("the test data is : ", camtoworld)
-
-
-
-
-        rendered_np = rendered_depth
-        image_np = image_depth
-        # print("render: ", type(rendered_depth))
-        # print("base: ", type(image_depth))
-
-
-
-
         # rendered_image, target_image = self.save_tensors_side_by_side(rendered_np, image_np, f"depth_debug/00{self.trainset.indices[viewpoint_cam['image_id'].item()]}.png")
-
-        # print(f"Rendered depth - min: {rendered_image.min()}, max: {rendered_image.max()}")
-        # print(f"Image depth    - min: {target_image.min()}, max: {target_image.max()}")
-
 
         l1loss = F.l1_loss(rendered_depth, image_depth)
         ssimloss = 1.0 - fused_ssim(
@@ -631,7 +582,6 @@ class Runner:
     @torch.no_grad()
     def prune(self, prune_ratio: float):
         print("Running pruning...")
-        device = self.device
         scores = torch.zeros_like(self.splats["means"])
         mask_views = torch.zeros_like(self.splats["means"])
 
@@ -646,16 +596,12 @@ class Runner:
         i = 0 
         pbar = tqdm.tqdm(trainloader, desc="Computing pruning scores")
         for data in pbar:
-            # if 10 > i : 
-            #     print("the data in loop is : ", data)
             self.score_func(data, scores, mask_views)
             pbar.update(1)
             i += 1
 
-
         scores = scores / (mask_views + 1e-8)
 
-        # Prune Gaussians
         self.prune_gaussians(prune_ratio, scores)
         
 
@@ -671,8 +617,6 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
         quats = self.splats["quats"]  # [N, 4]
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
@@ -817,11 +761,8 @@ class Runner:
         W, H = img_wh
         c2w = camera_state.c2w
         K = camera_state.get_K(img_wh)
-        # print("the K matrix is equal to : ", K)
         c2w = torch.from_numpy(c2w).float().to(self.device)
         K = torch.from_numpy(K).float().to(self.device)
-
-        # print("the cam to world matrix is : ", c2w)
 
         render_colors, _, _ = self.rasterize_splats(
             camtoworlds=c2w[None],
@@ -850,7 +791,6 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         print("the size of gaussian is:", runner.splats["means"].shape)
 
         # save checkpoint after hard pruning
-        mem = torch.cuda.max_memory_allocated() / 1024**3
         step = runner.steps
         
         name = os.path.splitext(os.path.basename(cfg.ckpt[0]))[0]
@@ -881,18 +821,6 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
 
 
 if __name__ == "__main__":
-    """
-    Usage:
-
-    ```bash
-    # Single GPU training
-    CUDA_VISIBLE_DEVICES=0 python simple_trainer.py default
-
-    # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
-
-    """
-
     # Config objects we can choose between.
     # Each is a tuple of (CLI description, config object).
     configs = {
