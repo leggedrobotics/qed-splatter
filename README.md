@@ -35,9 +35,14 @@ ns-train qed-splatter --data [PATH]
 
 ## Pruning Extension
 
-The pruning extension provides tools to reduce the number of Gaussians to increase the rendering speed. There are two main types of pruner available. Soft pruner reduce the number of Gaussians during training. Hard pruner are a post processing tool which can be used after training. Each pruner computes a pruning score to rank the importance of Gaussians. The least important are pruned.
+The pruning extension provides tools to reduce the number of Gaussians in order to improve rendering speed. There are two main types of pruners available:
 
-Currently two scripts are usable: RGB_hard_pruner and depth_hard_pruner. 
+- **Soft pruners** gradually reduce the number of Gaussians during training.
+- **Hard pruners** are post-processing tools applied after training is complete.
+
+Each pruner computes a *pruning score* to evaluate the importance of individual Gaussians. The least important Gaussians are then removed.
+
+Currently, two hard pruning scripts are available: `rgb_hard_pruner` and `depth_hard_pruner`.
 
 ### RGB_hard_pruner
 This pruner uses RGB loss to compute a pruning score to do hard pruning.
