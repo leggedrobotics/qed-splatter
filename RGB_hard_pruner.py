@@ -247,7 +247,6 @@ class Runner:
         
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
-        print("Scene scale:", self.scene_scale)
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -376,15 +375,12 @@ class Runner:
         cfg: Optional[List[str]] = None,
     ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
         
-        print("the path is : ", cfg.ckpt)
+  
 
         self.steps, splats = load_splats(cfg.ckpt[0], device)
 
         # Convert to ParameterDict on the correct device
         splats = torch.nn.ParameterDict(splats).to(device)
-
-
-        print("size of the splats for sh0m shN, means, opacities, scales, is : ", splats["sh0"].shape, splats["shN"].shape, splats["means"].shape, splats["opacities"].shape, splats["scales"].shape)
 
 
         # Learning rates: you need to define them since they’re not stored in the ckpt
@@ -818,10 +814,10 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         if cfg.eval_only:
             runner.eval(step=step)
         else:        
-            print("We are now hard pruning")
+            print("Hard pruning in progress...")
             if cfg.pruning_ratio != 0:
                 runner.prune(prune_ratio=cfg.pruning_ratio)
-            print("the size of gaussian is:", runner.splats["means"].shape)
+            print("The size of gaussian is:", runner.splats["means"].shape)
 
             # save checkpoint after hard pruning 
             name = os.path.splitext(os.path.basename(cfg.ckpt[0]))[0]

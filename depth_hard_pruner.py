@@ -251,7 +251,6 @@ class Runner:
         
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
-        print("Scene scale:", self.scene_scale)
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -378,16 +377,12 @@ class Runner:
         world_size: int = 1,
         cfg: Optional[List[str]] = None,
     ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-        
-        print("the path is : ", cfg.ckpt)
+
 
         self.steps, splats = load_splats(cfg.ckpt[0], device)
 
         # Convert to ParameterDict on the correct device
         splats = torch.nn.ParameterDict(splats).to(device)
-
-
-        print("size of the splats for sh0m shN, means, opacities, scales, is : ", splats["sh0"].shape, splats["shN"].shape, splats["means"].shape, splats["opacities"].shape, splats["scales"].shape)
 
 
         # Learning rates: you need to define them since they’re not stored in the ckpt
@@ -462,8 +457,6 @@ class Runner:
         reduced_scores = scores.mean(dim=1)
 
         num_prune = int(len(reduced_scores) * prune_ratio)
-        print("the number of gaussians to remove is : ",num_prune)
-        print("the size of the squeezed score is : ", reduced_scores.shape)
         _, idx = torch.topk(reduced_scores, k=num_prune, largest=False)
         mask = torch.ones_like(reduced_scores, dtype=torch.bool)
         mask[idx] = False
@@ -785,10 +778,11 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         # run eval only
         runner = Runner(local_rank, world_rank, world_size, cfg)
                 
-        print("We are now hard pruning")
+        
         if cfg.pruning_ratio != 0:
+            print("Hard pruning in progress...")
             runner.prune(prune_ratio=cfg.pruning_ratio)
-        print("the size of gaussian is:", runner.splats["means"].shape)
+        print("The size of gaussian is:", runner.splats["means"].shape)
 
         # save checkpoint after hard pruning
         step = runner.steps
