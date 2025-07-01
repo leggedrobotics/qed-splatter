@@ -60,7 +60,37 @@ python3 RGB_hard_pruner.py default --data-dir datasets/park --ckpt results/park/
 | `--result-dir`    | Directory where the output (pruned model) will be saved.                |
 
 
-### 🔧 `transforms.json` File
+## Input Format
+
+The code supports multiple output formats. The format is detected automatically. 
+- `ply` : expects a Nerfstudio format for the transforms. 
+- `ckpt` : expects a Nerfstudio format for the transforms. 
+- `pt` : expects a gsplat format for the transforms. 
+
+
+
+### GPSPlat Dataset Format
+
+This repository expects datasets to be structured in a COLMAP-like format, which includes camera parameters, image poses, and optionally 3D points. This format is commonly used for 3D reconstruction and novel view synthesis tasks.
+
+#### 📁 Folder Structure
+
+Your dataset should be organized like this:
+```
+data_dir/
+├── images/               # All input images
+│   ├── img1.jpg
+│   ├── img2.png
+│   └── ...
+├── sparse/               # Sparse reconstruction data (from COLMAP)
+│   ├── cameras.bin       # Camera intrinsics
+│   ├── images.bin        # Image poses (extrinsic) and filenames
+│   └── points3D.bin      # Optional: 3D point cloud
+```
+
+### Nerfstudio Dataset Format
+
+#### 🔧 `transforms.json` File
 
 This file must include the following:
 
@@ -101,13 +131,6 @@ This file must include the following:
   ]
 }
 ```
-
-## Input Format
-
-The code supports multiple output formats. The format is detected automatically. 
-- `ply` : expects a Nerfstudio format for the transforms. 
-- `ckpt` : expects a Nerfstudio format for the transforms. 
-- `pt` : expects a gsplat format for the transforms. 
 
 
 ### Depth_hard_pruner
