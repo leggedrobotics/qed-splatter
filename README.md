@@ -50,6 +50,11 @@ python3 RGB_hard_pruner.py default --data-dir datasets/park --ckpt results/park/
 ```
 ### Depth_hard_pruner
 This pruner uses depth loss to compute a pruning score to do hard pruning. It works analogously to the RGB hard pruner but not all features are available.
+python3 depth_hard_pruner.py default --data-dir datasets/park --ckpt results/park/step-000029999.ckpt --pruning-ratio 0.1 --result-dir output
+
+--eval-only (only evaluates, no saving, no pruning)  
+--pruning-ratio 0.0 (no pruning, saved in new format)  
+--output-format (ply (default), ckpt (nerfstudio), pt (gsplat))
 
 ### Soft Pruner (WIP)
 This pruner also uses RGB loss to compute the pruning score. To use the soft pruner during qed traing use the following command:
