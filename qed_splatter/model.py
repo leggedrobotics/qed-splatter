@@ -1,45 +1,46 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Type, Union
+from typing import Dict, List, Type, Union, Literal, Optional
 
 try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("Please install gsplat>=1.0.0")
 
+from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from nerfstudio.cameras.camera_optimizers import CameraOptimizer
 import torch
 from nerfstudio.models.splatfacto import SplatfactoModelConfig, SplatfactoModel
 from nerfstudio.cameras.cameras import Cameras
-from nerfstudio.utils.misc import torch_compile
 import torchvision.transforms.functional as TF
+import cv2
 from qed_splatter.metrics import RGBMetrics, DepthMetrics
+from nerfstudio.models.splatfacto import get_viewmat
+from nerfstudio.utils.math import k_nearest_sklearn, random_quat_tensor
+from nerfstudio.utils.spherical_harmonics import RGB2SH, num_sh_bases
+from nerfstudio.model_components.lib_bilagrid import BilateralGrid
+from nerfstudio.utils.rich_utils import CONSOLE
+from nerfstudio.data.scene_box import OrientedBox
+from pytorch_msssim import SSIM
+from qed_splatter.strategies.pixel_wise_probability import PixelWiseProbStrategy
+from nerfstudio.utils.colors import get_color
 
-@torch_compile()
-def get_viewmat(optimized_camera_to_world):
-    """
-    function that converts c2w to gsplat world2camera matrix, using compile for some speed
-    """
-    R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
-    T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
-    # flip the z and y axes to align with gsplat conventions
-    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
-    # analytic matrix inverse to get world2camera matrix
-    R_inv = R.transpose(1, 2)
-    T_inv = -torch.bmm(R_inv, T)
-    viewmat = torch.zeros(R.shape[0], 4, 4, device=R.device, dtype=R.dtype)
-    viewmat[:, 3, 3] = 1.0  # homogenous
-    viewmat[:, :3, :3] = R_inv
-    viewmat[:, :3, 3:4] = T_inv
-    return viewmat
 
 
 @dataclass
 class QEDSplatterModelConfig(SplatfactoModelConfig):
     _target: Type = field(default_factory=lambda: QEDSplatterModel)
-    depth_lambda: float = 0.2  # Weight for depth loss, found 0.2 to 0.3 to work well
+
+    depth_lambda: float = 0.2
+    """Weight for depth loss, found 0.2 to 0.3 to work well."""
     # random_scale: float = 100.0  # Random scale for the gaussians, set to 1 if you enable scaling
     output_depth_during_training: bool = True
+    """If True, the model will output depth during training."""
+    strategy: Literal["default", "mcmc", "pwp"] = "default"
+    """The default strategy will be used if strategy is not specified. Other strategies, e.g. mcmc, can be used."""
+    prob_add_every: int = 500
+    """Number of frames after which to add new Gaussians based on the probability map."""
 
 
 class QEDSplatterModel(SplatfactoModel):
@@ -58,11 +59,137 @@ class QEDSplatterModel(SplatfactoModel):
 
         @return: None
         """
-        super().populate_modules()
+        if self.seed_points is not None and not self.config.random_init:
+            means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
+        else:
+            means = torch.nn.Parameter((torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale)
+        distances, _ = k_nearest_sklearn(means.data, 3)
+        # find the average of the three nearest neighbors for each point and use that as the scale
+        avg_dist = distances.mean(dim=-1, keepdim=True)
+        scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
+        num_points = means.shape[0]
+        quats = torch.nn.Parameter(random_quat_tensor(num_points))
+        dim_sh = num_sh_bases(self.config.sh_degree)
+
+        if (
+                self.seed_points is not None
+                and not self.config.random_init
+                # We can have colors without points.
+                and self.seed_points[1].shape[0] > 0
+        ):
+            shs = torch.zeros((self.seed_points[1].shape[0], dim_sh, 3)).float().cuda()
+            if self.config.sh_degree > 0:
+                shs[:, 0, :3] = RGB2SH(self.seed_points[1] / 255)
+                shs[:, 1:, 3:] = 0.0
+            else:
+                CONSOLE.log("use color only optimization with sigmoid activation")
+                shs[:, 0, :3] = torch.logit(self.seed_points[1] / 255, eps=1e-10)
+            features_dc = torch.nn.Parameter(shs[:, 0, :])
+            features_rest = torch.nn.Parameter(shs[:, 1:, :])
+        else:
+            features_dc = torch.nn.Parameter(torch.rand(num_points, 3))
+            features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
+
+        opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
+        self.gauss_params = torch.nn.ParameterDict(
+            {
+                "means": means,
+                "scales": scales,
+                "quats": quats,
+                "features_dc": features_dc,
+                "features_rest": features_rest,
+                "opacities": opacities,
+            }
+        )
+
+        self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
+            num_cameras=self.num_train_data, device="cpu"
+        )
+
+        # metrics
+        from torchmetrics.image import PeakSignalNoiseRatio
+        from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0)
+        self.ssim = SSIM(data_range=1.0, size_average=True, channel=3)
+        self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True)
 
         self.rgb_metrics = RGBMetrics()
         self.depth_metrics = DepthMetrics()
         self.mse_loss = torch.nn.MSELoss()
+
+        self.step = 0
+
+        self.crop_box: Optional[OrientedBox] = None
+        if self.config.background_color == "random":
+            self.background_color = torch.tensor(
+                [0.1490, 0.1647, 0.2157]
+            )  # This color is the same as the default background color in Viser. This would only affect the background color when rendering.
+        else:
+            self.background_color = get_color(self.config.background_color)
+        if self.config.use_bilateral_grid:
+            self.bil_grids = BilateralGrid(
+                num=self.num_train_data,
+                grid_X=self.config.grid_shape[0],
+                grid_Y=self.config.grid_shape[1],
+                grid_W=self.config.grid_shape[2],
+            )
+
+        # Strategy for GS densification
+        if self.config.strategy == "default":
+            # Strategy for GS densification
+            self.strategy = DefaultStrategy(
+                prune_opa=self.config.cull_alpha_thresh,
+                grow_grad2d=self.config.densify_grad_thresh,
+                grow_scale3d=self.config.densify_size_thresh,
+                grow_scale2d=self.config.split_screen_size,
+                prune_scale3d=self.config.cull_scale_thresh,
+                prune_scale2d=self.config.cull_screen_size,
+                refine_scale2d_stop_iter=self.config.stop_screen_size_at,
+                refine_start_iter=self.config.warmup_length,
+                refine_stop_iter=self.config.stop_split_at,
+                reset_every=self.config.reset_alpha_every * self.config.refine_every,
+                refine_every=self.config.refine_every,
+                pause_refine_after_reset=self.num_train_data + self.config.refine_every,
+                absgrad=self.config.use_absgrad,
+                revised_opacity=False,
+                verbose=True,
+            )
+            self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
+        elif self.config.strategy == "mcmc":
+            self.strategy = MCMCStrategy(
+                cap_max=self.config.max_gs_num,
+                noise_lr=self.config.noise_lr,
+                refine_start_iter=self.config.warmup_length,
+                refine_stop_iter=self.config.stop_split_at,
+                refine_every=self.config.refine_every,
+                min_opacity=self.config.cull_alpha_thresh,
+                verbose=False,
+            )
+            self.strategy_state = self.strategy.initialize_state()
+        elif self.config.strategy == "pwp":
+            self.strategy = PixelWiseProbStrategy(
+                prob_add_every=self.config.prob_add_every,
+                prune_opa=self.config.cull_alpha_thresh,
+                grow_grad2d=self.config.densify_grad_thresh,
+                grow_scale3d=self.config.densify_size_thresh,
+                grow_scale2d=self.config.split_screen_size,
+                prune_scale3d=self.config.cull_scale_thresh,
+                prune_scale2d=self.config.cull_screen_size,
+                refine_scale2d_stop_iter=self.config.stop_screen_size_at,
+                refine_start_iter=self.config.warmup_length,
+                refine_stop_iter=self.config.stop_split_at,
+                reset_every=self.config.reset_alpha_every * self.config.refine_every,
+                refine_every=self.config.refine_every,
+                pause_refine_after_reset=self.num_train_data + self.config.refine_every,
+                absgrad=self.config.use_absgrad,
+                revised_opacity=False,
+                verbose=True
+            )
+            self.strategy_state = self.strategy.initialize_state(scene_scale=1.0)
+        else:
+            raise ValueError(f"""Splatfacto does not support strategy {self.config.strategy}
+                                     Currently, the supported strategies include default and mcmc.""")
 
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
@@ -186,6 +313,39 @@ class QEDSplatterModel(SplatfactoModel):
 
         return metrics_dict
 
+    def step_post_backward(self, step):
+        assert step == self.step
+        if isinstance(self.strategy, DefaultStrategy):
+            self.strategy.step_post_backward(
+                params=self.gauss_params,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=self.step,
+                info=self.info,
+                packed=False,
+            )
+        elif isinstance(self.strategy, MCMCStrategy):
+            self.strategy.step_post_backward(
+                params=self.gauss_params,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=step,
+                info=self.info,
+                lr=self.schedulers["means"].get_last_lr()[0],  # the learning rate for the "means" attribute of the GS
+            )
+        elif isinstance(self.strategy, PixelWiseProbStrategy):
+            self.strategy.step_post_backward(
+                params=self.gauss_params,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=self.step,
+                info=self.info,
+                packed=False,
+                probability_map=False
+            )
+        else:
+            raise ValueError(f"Unknown strategy {self.strategy}")
+
     def get_outputs(self, camera: Cameras) -> Dict[str, Union[torch.Tensor, List]]:
         """
         Generates the outputs of the model given a camera.
@@ -271,7 +431,8 @@ class QEDSplatterModel(SplatfactoModel):
             render_mode=render_mode,
             sh_degree=sh_degree_to_use,
             sparse_grad=False,
-            absgrad=True,
+            absgrad=self.strategy.absgrad if (isinstance(self.strategy, DefaultStrategy) or
+                                              isinstance(self.strategy, PixelWiseProbStrategy)) else False,
             rasterize_mode=self.config.rasterize_mode,
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,

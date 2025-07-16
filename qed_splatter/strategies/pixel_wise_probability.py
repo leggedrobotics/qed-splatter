@@ -35,6 +35,7 @@ class PixelWiseProbStrategy(DefaultStrategy):
             step: int,
             info: Dict[str, Any],
             packed: bool = False,
+            probability_map: bool = False
     ):
         super().step_post_backward(params, optimizers, state, step, info, packed)
 
