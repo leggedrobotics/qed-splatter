@@ -16,7 +16,6 @@ from nerfstudio.cameras.cameras import Cameras
 import torchvision.transforms.functional as TF
 import cv2
 from qed_splatter.metrics import RGBMetrics, DepthMetrics
-from nerfstudio.models.splatfacto import get_viewmat
 from nerfstudio.utils.math import k_nearest_sklearn, random_quat_tensor
 from nerfstudio.utils.spherical_harmonics import RGB2SH, num_sh_bases
 from nerfstudio.model_components.lib_bilagrid import BilateralGrid
@@ -25,8 +24,29 @@ from nerfstudio.data.scene_box import OrientedBox
 from pytorch_msssim import SSIM
 from qed_splatter.strategies.pixel_wise_probability import PixelWiseProbStrategy
 from nerfstudio.utils.colors import get_color
+import numpy as np
+from nerfstudio.utils.misc import torch_compile
 
+# Pre-create the flip tensor for get_viewmat to avoid tracing issues
+_FLIP_GSPLAT = torch.tensor([[[1, -1, -1]]], dtype=torch.float32)
 
+def get_viewmat(optimized_camera_to_world):
+    """
+    function that converts c2w to gsplat world2camera matrix
+    """
+    R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
+    T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
+    # flip the z and y axes to align with gsplat conventions
+    flip = _FLIP_GSPLAT.to(R.device, R.dtype)
+    R = R * flip
+    # analytic matrix inverse to get world2camera matrix
+    R_inv = R.transpose(1, 2)
+    T_inv = -torch.bmm(R_inv, T)
+    viewmat = torch.zeros(R.shape[0], 4, 4, device=R.device, dtype=R.dtype)
+    viewmat[:, 3, 3] = 1.0  # homogenous
+    viewmat[:, :3, :3] = R_inv
+    viewmat[:, :3, 3:4] = T_inv
+    return viewmat
 
 @dataclass
 class QEDSplatterModelConfig(SplatfactoModelConfig):
@@ -464,9 +484,34 @@ class QEDSplatterModel(SplatfactoModel):
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
+        # Laplacian computation (no_grad, no matplotlib)
+        with torch.no_grad():
+            rgb_np = rgb.squeeze(0).cpu().numpy()  # [H, W, 3]
+            rgb_np = np.clip(rgb_np, 0.0, 1.0)
+            if rgb_np.ndim == 3 and rgb_np.shape[2] == 3:
+                # Convert to float32
+                rgb_np = rgb_np.astype(np.float32)
+                # Apply Gaussian blur and Laplacian per channel
+                blurred = np.stack([
+                    cv2.GaussianBlur(rgb_np[..., c], (0, 0), 1.0)
+                    for c in range(3)
+                ], axis=-1)
+                laplacian = np.stack([
+                    cv2.Laplacian(blurred[..., c], cv2.CV_32F, ksize=3)
+                    for c in range(3)
+                ], axis=-1)
+                # Compute L2 norm across channels
+                laplacian_norm = np.sqrt(np.sum(laplacian ** 2, axis=-1))  # [H, W]
+                laplacian_clamped = np.clip(laplacian_norm, 0.0, 1.0)
+                laplacian_tensor = torch.from_numpy(laplacian_clamped).to(rgb.device).float()
+                laplacian_tensor = laplacian_tensor.unsqueeze(-1).repeat(1, 1, 3)  # [H, W, 3]
+            else:
+                laplacian_tensor = torch.zeros((rgb.shape[1], rgb.shape[2], 3), device=rgb.device)
+
         return {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
+            "laplacian_norm": laplacian_tensor, # type: ignore
         }  # type: ignore

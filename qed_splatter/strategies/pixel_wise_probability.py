@@ -40,5 +40,6 @@ class PixelWiseProbStrategy(DefaultStrategy):
         super().step_post_backward(params, optimizers, state, step, info, packed)
 
         if step % self.prob_add_every == 0:
+            pass
 
 
