@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Type, Union, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Type, Union, Literal, Optional
 
 try:
     from gsplat.rendering import rasterization
@@ -26,6 +26,10 @@ from qed_splatter.strategies.pixel_wise_probability import PixelWiseProbStrategy
 from nerfstudio.utils.colors import get_color
 import numpy as np
 from nerfstudio.utils.misc import torch_compile
+
+
+if TYPE_CHECKING:
+    from nerfstudio.pipelines.base_pipeline import Pipeline
 
 # Pre-create the flip tensor for get_viewmat to avoid tracing issues
 _FLIP_GSPLAT = torch.tensor([[[1, -1, -1]]], dtype=torch.float32)
@@ -211,6 +215,26 @@ class QEDSplatterModel(SplatfactoModel):
             raise ValueError(f"""Splatfacto does not support strategy {self.config.strategy}
                                      Currently, the supported strategies include default and mcmc.""")
 
+    def get_training_callbacks(
+            self, training_callback_attributes: TrainingCallbackAttributes
+    ) -> List[TrainingCallback]:
+        cbs = []
+        cbs.append(
+            TrainingCallback(
+                [TrainingCallbackLocation.BEFORE_TRAIN_ITERATION],
+                self.step_cb,
+                args=[training_callback_attributes.optimizers],
+            )
+        )
+        cbs.append(
+            TrainingCallback(
+                [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
+                self.step_post_backward,
+                args=[training_callback_attributes.pipeline],
+            )
+        )
+        return cbs
+
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         """
@@ -333,7 +357,7 @@ class QEDSplatterModel(SplatfactoModel):
 
         return metrics_dict
 
-    def step_post_backward(self, step):
+    def step_post_backward(self, pipeline: Pipeline, step):
         assert step == self.step
         if isinstance(self.strategy, DefaultStrategy):
             self.strategy.step_post_backward(
