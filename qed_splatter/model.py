@@ -23,6 +23,7 @@ from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.data.scene_box import OrientedBox
 from pytorch_msssim import SSIM
 from qed_splatter.strategies.pixel_wise_probability import PixelWiseProbStrategy
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from nerfstudio.utils.colors import get_color
 import numpy as np
 from nerfstudio.engine.callbacks import (
@@ -361,27 +362,59 @@ class QEDSplatterModel(SplatfactoModel):
 
         return metrics_dict
 
+    def calculate_prob(self, pipeline: Pipeline, step):
+        """
+        Calculates the laplacian of the RGB and GT RGB images. Then subtracts the two to get the edge difference.
+        We later use this to add gaussians to the model based on the edge difference.
+        """
+        datamanager = pipeline.datamanager
+        assert hasattr(datamanager, "fixed_indices_eval_dataloader"), (
+            "datamanager must have 'fixed_indices_eval_dataloader' attribute"
+        )
+
+        datamanager.eval()
+        dataloader = self.datamanager.fixed_indices_eval_dataloader
+        num_images = len(dataloader)
+        CONSOLE.log(f"Calculating edge difference for step {step} with {num_images} images")
+
+        with Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TimeElapsedColumn(),
+                MofNCompleteColumn(),
+                transient=True,
+        ) as progress:
+            task = progress.add_task("[green]Calculating Edge Diff", total=num_images)
+            idx = 0
+            for camera, batch in dataloader:
+                outputs = self.get_outputs_for_camera(camera=camera)
+                diff = self.calculate_edge_diff()
+
+    def calculate_edge_diff(self, outputs, batch):
+        pred_img = outputs['rgb']
+        gt_img = self.get_gt_img(batch['image'])
+
+        # Calculate Laplacian of both images
+        with torch.no_grad():
+            pred_img_np = pred_img.squeeze(0).cpu().numpy()
+            gt_img_np = gt_img.squeeze(0).cpu().numpy()
+            pred_laplacian = cv2.Laplacian(pred_img_np, cv2.CV_32F, ksize=3)
+            gt_laplacian = cv2.Laplacian(gt_img_np, cv2.CV_32F, ksize=3)
+
+            
+
+
     def step_post_backwards(self, pipeline: Pipeline, step):
+        # Note: Function is called step_post_backward in splatfacto, to avoid a signature mismatch, we rename it here
         assert step == self.step
-        if isinstance(self.strategy, DefaultStrategy):
-            self.strategy.step_post_backward(
-                params=self.gauss_params,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=self.step,
-                info=self.info,
-                packed=False,
-            )
-        elif isinstance(self.strategy, MCMCStrategy):
-            self.strategy.step_post_backward(
-                params=self.gauss_params,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=self.info,
-                lr=self.schedulers["means"].get_last_lr()[0],  # the learning rate for the "means" attribute of the GS
-            )
-        elif isinstance(self.strategy, PixelWiseProbStrategy):
+        if isinstance(self.strategy, PixelWiseProbStrategy):
+            if self.step % self.config.prob_add_every == 0:
+                prob = self.calculate_prob(pipeline, step)
+
+                # self.strategy.add_gaussians(
+                #
+                # )
+
             self.strategy.step_post_backward(
                 params=self.gauss_params,
                 optimizers=self.optimizers,
