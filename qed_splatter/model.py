@@ -233,7 +233,7 @@ class QEDSplatterModel(SplatfactoModel):
         cbs.append(
             TrainingCallback(
                 [TrainingCallbackLocation.AFTER_TRAIN_ITERATION],
-                self.step_post_backward,
+                self.step_post_backwards,
                 args=[training_callback_attributes.pipeline],
             )
         )
@@ -361,7 +361,7 @@ class QEDSplatterModel(SplatfactoModel):
 
         return metrics_dict
 
-    def step_post_backward(self, pipeline: Pipeline, step):
+    def step_post_backwards(self, pipeline: Pipeline, step):
         assert step == self.step
         if isinstance(self.strategy, DefaultStrategy):
             self.strategy.step_post_backward(
