@@ -484,7 +484,7 @@ class QEDSplatterModel(SplatfactoModel):
         if background.shape[0] == 3 and not self.training:
             background = background.expand(H, W, 3)
 
-        # Laplacian computation (no_grad, no matplotlib)
+        # Laplacian computation
         with torch.no_grad():
             rgb_np = rgb.squeeze(0).cpu().numpy()  # [H, W, 3]
             rgb_np = np.clip(rgb_np, 0.0, 1.0)
@@ -496,22 +496,34 @@ class QEDSplatterModel(SplatfactoModel):
                     cv2.GaussianBlur(rgb_np[..., c], (0, 0), 1.0)
                     for c in range(3)
                 ], axis=-1)
-                laplacian = np.stack([
+                rgb_laplacian = np.stack([
                     cv2.Laplacian(blurred[..., c], cv2.CV_32F, ksize=3)
                     for c in range(3)
                 ], axis=-1)
                 # Compute L2 norm across channels
-                laplacian_norm = np.sqrt(np.sum(laplacian ** 2, axis=-1))  # [H, W]
-                laplacian_clamped = np.clip(laplacian_norm, 0.0, 1.0)
-                laplacian_tensor = torch.from_numpy(laplacian_clamped).to(rgb.device).float()
-                laplacian_tensor = laplacian_tensor.unsqueeze(-1).repeat(1, 1, 3)  # [H, W, 3]
+                rgb_laplacian_norm = np.sqrt(np.sum(rgb_laplacian ** 2, axis=-1))  # [H, W]
+                rgb_laplacian_clamped = np.clip(rgb_laplacian_norm, 0.0, 1.0)
+                rgb_laplacian_tensor = torch.from_numpy(rgb_laplacian_clamped).to(rgb.device).float()
+                rgb_laplacian_tensor = rgb_laplacian_tensor.unsqueeze(-1).repeat(1, 1, 3)  # [H, W, 3]
             else:
-                laplacian_tensor = torch.zeros((rgb.shape[1], rgb.shape[2], 3), device=rgb.device)
+                rgb_laplacian_tensor = torch.zeros((rgb.shape[1], rgb.shape[2], 3), device=rgb.device)
 
-        return {
+            # Depth Laplacian computation
+            if depth_im is not None:
+                depth_np = depth_im.cpu().numpy().astype(np.float32)  # [H, W]
+                depth_blurred = cv2.GaussianBlur(depth_np, (0, 0), 1.0)
+                depth_laplacian = cv2.Laplacian(depth_blurred, cv2.CV_32F, ksize=3)
+                depth_laplacian_norm = np.abs(depth_laplacian)  # [H, W]
+                depth_laplacian_clamped = np.clip(depth_laplacian_norm, 0.0, 1.0)
+                depth_laplacian_tensor = torch.from_numpy(depth_laplacian_clamped).to(rgb.device).float()
+            else:
+                depth_laplacian_tensor = torch.zeros((rgb.shape[1], rgb.shape[2]), device=rgb.device)
+
+    return {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
-            "laplacian_norm": laplacian_tensor, # type: ignore
+            "rgb_laplacian_norm": laplacian_tensor, # type: ignore
+            "depth_laplacian_norm": depth_laplacian_tensor,  # type: ignore
         }  # type: ignore
