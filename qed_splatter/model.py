@@ -380,9 +380,9 @@ class QEDSplatterModel(SplatfactoModel):
         num_images = len(dataloader)
         CONSOLE.log(f"Calculating edge difference for step {step} with {num_images} images")
 
-        output_path: Path = Path("edge_diff")
-        if output_path is not None:
-            output_path.mkdir(exist_ok=True, parents=True)
+        # output_path: Path = Path("edge_diff")
+        # if output_path is not None:
+        #     output_path.mkdir(exist_ok=True, parents=True)
 
         diff_list = []
 
@@ -402,19 +402,19 @@ class QEDSplatterModel(SplatfactoModel):
                     batch=batch,
                 )
 
-                if output_path is not None:
-                    # Convert to RGB format and save the edge difference image
-
-                    edge_diff_tensor = torch.from_numpy(tmp).float()  # tmp is the edge_diff
-                    if edge_diff_tensor.ndim == 2:
-                        edge_diff_tensor = edge_diff_tensor.unsqueeze(0)  # [1, H, W]
-                    elif edge_diff_tensor.ndim == 3:
-                        edge_diff_tensor = edge_diff_tensor.permute(2, 0, 1)  # [C, H, W]
-
-                    vutils.save_image(
-                        edge_diff_tensor,
-                        output_path / f"diff_{idx:04d}.png"
-                    )
+                # if output_path is not None:
+                #     # Convert to RGB format and save the edge difference image
+                #
+                #     edge_diff_tensor = torch.from_numpy(tmp).float()  # tmp is the edge_diff
+                #     if edge_diff_tensor.ndim == 2:
+                #         edge_diff_tensor = edge_diff_tensor.unsqueeze(0)  # [1, H, W]
+                #     elif edge_diff_tensor.ndim == 3:
+                #         edge_diff_tensor = edge_diff_tensor.permute(2, 0, 1)  # [C, H, W]
+                #
+                #     vutils.save_image(
+                #         edge_diff_tensor,
+                #         output_path / f"diff_{idx:04d}.png"
+                #     )
 
                 progress.advance(task)
                 idx += 1
@@ -472,9 +472,6 @@ class QEDSplatterModel(SplatfactoModel):
     def step_post_backwards(self, pipeline: Pipeline, step):
         # Note: Function is called step_post_backward in splatfacto, to avoid a signature mismatch, we rename it here
         assert step == self.step
-
-        if step > 1000 and step % 500 == 0:
-            self.calculate_total_edge_diff(pipeline, step)
 
         if isinstance(self.strategy, DefaultStrategy):
             self.strategy.step_post_backward(
@@ -606,6 +603,11 @@ class QEDSplatterModel(SplatfactoModel):
             # set some threshold to disregrad small gaussians for faster rendering.
             # radius_clip=3.0,
         )
+        if self.training:
+            self.strategy.step_pre_backward(
+                self.gauss_params, self.optimizers, self.strategy_state, self.step, self.info
+            )
+
         if self.training and self.info["means2d"].requires_grad:
             self.info["means2d"].retain_grad()
         self.xys = self.info["means2d"]  # [1, N, 2]
