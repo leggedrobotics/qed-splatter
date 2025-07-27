@@ -32,6 +32,9 @@ from nerfstudio.engine.callbacks import (
     TrainingCallbackLocation,
 )
 
+from pathlib import Path
+import torchvision.utils as vutils
+
 
 if TYPE_CHECKING:
     from nerfstudio.pipelines.base_pipeline import Pipeline
@@ -373,9 +376,13 @@ class QEDSplatterModel(SplatfactoModel):
         )
 
         pipeline.eval()
-        dataloader = self.datamanager.fixed_indices_eval_dataloader
+        dataloader = datamanager.fixed_indices_eval_dataloader
         num_images = len(dataloader)
         CONSOLE.log(f"Calculating edge difference for step {step} with {num_images} images")
+
+        output_path: Path = Path("edge_diff")
+        if output_path is not None:
+            output_path.mkdir(exist_ok=True, parents=True)
 
         diff_list = []
 
@@ -390,10 +397,24 @@ class QEDSplatterModel(SplatfactoModel):
             idx = 0
             for camera, batch in dataloader:
                 outputs = self.get_outputs_for_camera(camera=camera)
-                diff_list.append(self.calculate_edge_diff(
+                tmp = self.calculate_edge_diff(
                     outputs=outputs,
                     batch=batch,
-                ))
+                )
+
+                if output_path is not None:
+                    # Convert to RGB format and save the edge difference image
+
+                    edge_diff_tensor = torch.from_numpy(tmp).float()  # tmp is the edge_diff
+                    if edge_diff_tensor.ndim == 2:
+                        edge_diff_tensor = edge_diff_tensor.unsqueeze(0)  # [1, H, W]
+                    elif edge_diff_tensor.ndim == 3:
+                        edge_diff_tensor = edge_diff_tensor.permute(2, 0, 1)  # [C, H, W]
+
+                    vutils.save_image(
+                        edge_diff_tensor,
+                        output_path / f"diff_{idx:04d}.png"
+                    )
 
                 progress.advance(task)
                 idx += 1
@@ -408,15 +429,38 @@ class QEDSplatterModel(SplatfactoModel):
         pred_img = outputs['rgb']
         gt_img = self.get_gt_img(batch['image'])
 
-        # Calculate Laplacian of both images
         with torch.no_grad():
             pred_img_np = pred_img.squeeze(0).cpu().numpy()
             gt_img_np = gt_img.squeeze(0).cpu().numpy()
-            pred_laplacian = cv2.Laplacian(pred_img_np, cv2.CV_32F, ksize=3)
-            gt_laplacian = cv2.Laplacian(gt_img_np, cv2.CV_32F, ksize=3)
+
+            # Apply Gaussian blur and Laplacian per channel
+            blurred_pred = np.stack([
+                cv2.GaussianBlur(pred_img_np[..., c], (0, 0), 1.0)
+                for c in range(3)
+            ], axis=-1)
+            pred_laplacian = np.stack([
+                cv2.Laplacian(blurred_pred[..., c], cv2.CV_32F, ksize=3)
+                for c in range(3)
+            ], axis=-1)
+
+            # Compute L2 norm across channels
+            pred_laplacian_norm = np.sqrt(np.sum(pred_laplacian ** 2, axis=-1))
+            # Ensure gt_img_np is blurred and laplacian is computed as well
+            blurred_gt = np.stack([
+                cv2.GaussianBlur(gt_img_np[..., c], (0, 0), 1.0)
+                for c in range(3)
+            ], axis=-1)
+            gt_laplacian = np.stack([
+                cv2.Laplacian(blurred_gt[..., c], cv2.CV_32F, ksize=3)
+                for c in range(3)
+            ], axis=-1)
+            gt_laplacian_norm = np.sqrt(np.sum(gt_laplacian ** 2, axis=-1))
+
+            pred_laplacian_clamped = np.clip(pred_laplacian_norm, 0.0, 1.0)
+            gt_laplacian_clamped = np.clip(gt_laplacian_norm, 0.0, 1.0)
 
             # Difference between the two Laplacians
-            edge_diff = np.maximum(gt_laplacian - pred_laplacian, 0)
+            edge_diff = np.maximum(gt_laplacian_clamped - pred_laplacian_clamped, 0)
 
             if 'mask' in batch:
                 # Set edge_diff to zero where mask is zero
@@ -428,9 +472,32 @@ class QEDSplatterModel(SplatfactoModel):
     def step_post_backwards(self, pipeline: Pipeline, step):
         # Note: Function is called step_post_backward in splatfacto, to avoid a signature mismatch, we rename it here
         assert step == self.step
-        if isinstance(self.strategy, PixelWiseProbStrategy):
+
+        if step > 1000 and step % 500 == 0:
+            self.calculate_total_edge_diff(pipeline, step)
+
+        if isinstance(self.strategy, DefaultStrategy):
+            self.strategy.step_post_backward(
+                params=self.gauss_params,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=self.step,
+                info=self.info,
+                packed=False,
+            )
+        elif isinstance(self.strategy, MCMCStrategy):
+            self.strategy.step_post_backward(
+                params=self.gauss_params,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                step=step,
+                info=self.info,
+                lr=self.schedulers["means"].get_last_lr()[0],  # the learning rate for the "means" attribute of the GS
+            )
+        elif isinstance(self.strategy, PixelWiseProbStrategy): # TODO: Might need to be moved up as inheritance of defaultStrategy
             if self.step % self.config.prob_add_every == 0:
-                prob = self.calculate_total_edge_diff(pipeline, step)
+                pass
+                # prob = self.calculate_total_edge_diff(pipeline, step)
 
                 # self.strategy.add_gaussians(
                 #
