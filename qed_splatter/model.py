@@ -25,7 +25,11 @@ from pytorch_msssim import SSIM
 from qed_splatter.strategies.pixel_wise_probability import PixelWiseProbStrategy
 from nerfstudio.utils.colors import get_color
 import numpy as np
-from nerfstudio.utils.misc import torch_compile
+from nerfstudio.engine.callbacks import (
+    TrainingCallback,
+    TrainingCallbackAttributes,
+    TrainingCallbackLocation,
+)
 
 
 if TYPE_CHECKING:
@@ -540,14 +544,15 @@ class QEDSplatterModel(SplatfactoModel):
                 depth_laplacian_norm = np.abs(depth_laplacian)  # [H, W]
                 depth_laplacian_clamped = np.clip(depth_laplacian_norm, 0.0, 1.0)
                 depth_laplacian_tensor = torch.from_numpy(depth_laplacian_clamped).to(rgb.device).float()
+                depth_laplacian_tensor = depth_laplacian_tensor.unsqueeze(-1).repeat(1, 1, 3)  # [H, W, 3]
             else:
-                depth_laplacian_tensor = torch.zeros((rgb.shape[1], rgb.shape[2]), device=rgb.device)
+                depth_laplacian_tensor = torch.zeros((rgb.shape[1], rgb.shape[2], 3), device=rgb.device)
 
-    return {
+        return {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore
-            "rgb_laplacian_norm": laplacian_tensor, # type: ignore
+            "rgb_laplacian_norm": rgb_laplacian_tensor, # type: ignore
             "depth_laplacian_norm": depth_laplacian_tensor,  # type: ignore
         }  # type: ignore
