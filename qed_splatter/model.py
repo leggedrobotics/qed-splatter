@@ -362,7 +362,7 @@ class QEDSplatterModel(SplatfactoModel):
 
         return metrics_dict
 
-    def calculate_prob(self, pipeline: Pipeline, step):
+    def calculate_total_edge_diff(self, pipeline: Pipeline, step):
         """
         Calculates the laplacian of the RGB and GT RGB images. Then subtracts the two to get the edge difference.
         We later use this to add gaussians to the model based on the edge difference.
@@ -372,10 +372,12 @@ class QEDSplatterModel(SplatfactoModel):
             "datamanager must have 'fixed_indices_eval_dataloader' attribute"
         )
 
-        datamanager.eval()
+        pipeline.eval()
         dataloader = self.datamanager.fixed_indices_eval_dataloader
         num_images = len(dataloader)
         CONSOLE.log(f"Calculating edge difference for step {step} with {num_images} images")
+
+        diff_list = []
 
         with Progress(
                 TextColumn("[progress.description]{task.description}"),
@@ -388,7 +390,19 @@ class QEDSplatterModel(SplatfactoModel):
             idx = 0
             for camera, batch in dataloader:
                 outputs = self.get_outputs_for_camera(camera=camera)
-                diff = self.calculate_edge_diff()
+                diff_list.append(self.calculate_edge_diff(
+                    outputs=outputs,
+                    batch=batch,
+                ))
+
+                progress.advance(task)
+                idx += 1
+
+        pipeline.train()
+
+        # Return the edge differences
+        return
+
 
     def calculate_edge_diff(self, outputs, batch):
         pred_img = outputs['rgb']
@@ -401,15 +415,22 @@ class QEDSplatterModel(SplatfactoModel):
             pred_laplacian = cv2.Laplacian(pred_img_np, cv2.CV_32F, ksize=3)
             gt_laplacian = cv2.Laplacian(gt_img_np, cv2.CV_32F, ksize=3)
 
-            
+            # Difference between the two Laplacians
+            edge_diff = np.maximum(gt_laplacian - pred_laplacian, 0)
 
+            if 'mask' in batch:
+                # Set edge_diff to zero where mask is zero
+                mask = self.get_gt_img(batch['mask']).squeeze(0).cpu().numpy()
+                edge_diff *= mask
+
+            return edge_diff
 
     def step_post_backwards(self, pipeline: Pipeline, step):
         # Note: Function is called step_post_backward in splatfacto, to avoid a signature mismatch, we rename it here
         assert step == self.step
         if isinstance(self.strategy, PixelWiseProbStrategy):
             if self.step % self.config.prob_add_every == 0:
-                prob = self.calculate_prob(pipeline, step)
+                prob = self.calculate_total_edge_diff(pipeline, step)
 
                 # self.strategy.add_gaussians(
                 #
