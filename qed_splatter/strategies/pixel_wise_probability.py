@@ -24,22 +24,72 @@ class PixelWiseProbStrategy(DefaultStrategy):
     new Gaussians should be added, promoting effiscient and meaningful updates to the scene
     """
 
-    prob_add_every: int = 500
-    """Number of frames after which to add new Gaussians based on the probability map."""
 
-    def step_post_backward(
-            self,
-            params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-            optimizers: Dict[str, torch.optim.Optimizer],
-            state: Dict[str, Any],
-            step: int,
-            info: Dict[str, Any],
-            packed: bool = False,
-            probability_map: bool = False
+    def add_gaussians(self, total_edge_diff):
+        pass
+
+    @torch.no_grad()
+    def _insert_gaussians(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        optimizers: Dict[str, torch.optim.Optimizer],
+        state: Dict[str, Any],
+        positions: torch.Tensor,  # [M, 3]
+        scales: torch.Tensor,  # [M, 3]
+        rotations: torch.Tensor,  # [M, 4] or [M, 3, 3]
+        opacities: torch.Tensor,  # [M]
+        colors: torch.Tensor  # [M, 3]
     ):
-        super().step_post_backward(params, optimizers, state, step, info, packed)
+        """
+        Inserts new Gaussians into the parameter set.
+        """
+        device = params["positions"].device
+        dtype = params["positions"].dtype
 
-        if step % self.prob_add_every == 0:
-            pass
+        M = positions.shape[0]
+
+        # Sanity checks
+        assert positions.shape == (M, 3)
+        assert scales.shape == (M, 3)
+        assert rotations.shape[0] == M
+        assert opacities.shape == (M,)
+        assert colors.shape == (M, 3)
+
+        # Encode to match parameter space if needed
+        encoded_scales = torch.log(scales.clamp(min=1e-6)).to(device=device, dtype=dtype)
+        encoded_opacities = torch.logit(opacities.clamp(1e-4, 1 - 1e-4)).to(device=device, dtype=dtype)
+        encoded_positions = positions.to(device=device, dtype=dtype)
+        encoded_colors = colors.to(device=device, dtype=dtype)
+
+        # Handle rotations
+        if rotations.shape[-1] == 4:
+            encoded_rotations = rotations / rotations.norm(dim=-1, keepdim=True)  # quaternion
+        else:
+            encoded_rotations = rotations  # assume already normalized 3x3 matrices or similar
+
+        encoded_rotations = encoded_rotations.to(device=device, dtype=dtype)
+
+        # Append to parameters
+        for key, new_data in zip(
+                ["positions", "scales", "rotations", "opacities", "colors"],
+                [encoded_positions, encoded_scales, encoded_rotations, encoded_opacities, encoded_colors]
+        ):
+            param = params[key]
+            updated_param = torch.cat([param.data, new_data], dim=0)
+            params[key] = torch.nn.Parameter(updated_param, requires_grad=True)
+
+            # Replace in optimizer if needed
+            if key in optimizers:
+                del optimizers[key]
+                optimizers[key] = torch.optim.Adam([params[key]], lr=optimizers[key].defaults["lr"])
+
+        # Expand state entries for new Gaussians
+        for key in ["grad2d", "count", "radii"]:
+            if key in state and state[key] is not None:
+                state[key] = torch.cat([
+                    state[key],
+                    torch.zeros(M, device=state[key].device, dtype=state[key].dtype)
+                ], dim=0)
+
 
 

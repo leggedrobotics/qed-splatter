@@ -380,10 +380,6 @@ class QEDSplatterModel(SplatfactoModel):
         num_images = len(dataloader)
         CONSOLE.log(f"Calculating edge difference for step {step} with {num_images} images")
 
-        # output_path: Path = Path("edge_diff")
-        # if output_path is not None:
-        #     output_path.mkdir(exist_ok=True, parents=True)
-
         diff_list = []
 
         with Progress(
@@ -397,24 +393,13 @@ class QEDSplatterModel(SplatfactoModel):
             idx = 0
             for camera, batch in dataloader:
                 outputs = self.get_outputs_for_camera(camera=camera)
-                tmp = self.calculate_edge_diff(
-                    outputs=outputs,
-                    batch=batch,
-                )
-
-                # if output_path is not None:
-                #     # Convert to RGB format and save the edge difference image
-                #
-                #     edge_diff_tensor = torch.from_numpy(tmp).float()  # tmp is the edge_diff
-                #     if edge_diff_tensor.ndim == 2:
-                #         edge_diff_tensor = edge_diff_tensor.unsqueeze(0)  # [1, H, W]
-                #     elif edge_diff_tensor.ndim == 3:
-                #         edge_diff_tensor = edge_diff_tensor.permute(2, 0, 1)  # [C, H, W]
-                #
-                #     vutils.save_image(
-                #         edge_diff_tensor,
-                #         output_path / f"diff_{idx:04d}.png"
-                #     )
+                diff_list.append((
+                    camera,
+                    self.calculate_edge_diff(
+                        outputs=outputs,
+                        batch=batch,
+                    )
+                ))
 
                 progress.advance(task)
                 idx += 1
@@ -493,12 +478,11 @@ class QEDSplatterModel(SplatfactoModel):
             )
         elif isinstance(self.strategy, PixelWiseProbStrategy): # TODO: Might need to be moved up as inheritance of defaultStrategy
             if self.step % self.config.prob_add_every == 0:
-                pass
-                # prob = self.calculate_total_edge_diff(pipeline, step)
+                total_edge_diff = self.calculate_total_edge_diff(pipeline, step)
 
-                # self.strategy.add_gaussians(
-                #
-                # )
+                self.strategy.add_gaussians(
+                    total_edge_diff
+                )
 
             self.strategy.step_post_backward(
                 params=self.gauss_params,
