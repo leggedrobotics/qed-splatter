@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Type, Union, Literal, Optional
+from typing import TYPE_CHECKING, Dict, List, Type, Union, Literal, Optional, Tuple
+
+from qed_splatter.utils.prob_backprojection import laplacian_to_3dprob_field, visualize_sparse_volume
 
 try:
     from gsplat.rendering import rasterization
@@ -365,7 +367,7 @@ class QEDSplatterModel(SplatfactoModel):
 
         return metrics_dict
 
-    def calculate_total_edge_diff(self, pipeline: Pipeline, step):
+    def calculate_total_edge_diff(self, pipeline: Pipeline, step) -> List[Tuple[Cameras, np.ndarray]]:
         """
         Calculates the laplacian of the RGB and GT RGB images. Then subtracts the two to get the edge difference.
         We later use this to add gaussians to the model based on the edge difference.
@@ -407,10 +409,10 @@ class QEDSplatterModel(SplatfactoModel):
         pipeline.train()
 
         # Return the edge differences
-        return
+        return diff_list
 
 
-    def calculate_edge_diff(self, outputs, batch):
+    def calculate_edge_diff(self, outputs, batch) -> np.ndarray:
         pred_img = outputs['rgb']
         gt_img = self.get_gt_img(batch['image'])
 
@@ -458,6 +460,26 @@ class QEDSplatterModel(SplatfactoModel):
         # Note: Function is called step_post_backward in splatfacto, to avoid a signature mismatch, we rename it here
         assert step == self.step
 
+        if self.step == 1500:
+            total_edge_diff = self.calculate_total_edge_diff(pipeline, step)
+
+            CONSOLE.log(f"Total edge difference calculated for step {step}, length: {len(total_edge_diff)}")
+
+            sparse_volume = laplacian_to_3dprob_field(
+                camera_edgediff_map=total_edge_diff,
+            )
+
+            CONSOLE.log(f"Sparse volume created for step {step}, shape: {sparse_volume.shape}")
+
+            visualize_sparse_volume(
+                sparse_volume,
+                grid_origin=np.array([0.0, 0.0, 0.0]),
+                resolution=0.001,
+                grid_dims=np.ceil(np.array([2.0, 2.0, 2.0]) / 0.001).astype(int),
+                min_threshold=0.1,
+                max_points=50000
+            )
+
         if isinstance(self.strategy, DefaultStrategy):
             self.strategy.step_post_backward(
                 params=self.gauss_params,
@@ -480,9 +502,22 @@ class QEDSplatterModel(SplatfactoModel):
             if self.step % self.config.prob_add_every == 0:
                 total_edge_diff = self.calculate_total_edge_diff(pipeline, step)
 
-                self.strategy.add_gaussians(
-                    total_edge_diff
+                sparse_volume = laplacian_to_3dprob_field(
+                    camera_edgediff_map=total_edge_diff,
                 )
+
+                visualize_sparse_volume(
+                    sparse_volume,
+                    grid_origin=np.array([0.0, 0.0, 0.0]),
+                    resolution=0.01,
+                    grid_dims=np.ceil(np.array([2.0, 2.0, 2.0]) / 0.01).astype(int),
+                    min_threshold=0.1,
+                    max_points=50000
+                )
+
+                #self.strategy.add_gaussians(
+                #    total_edge_diff
+                #)
 
             self.strategy.step_post_backward(
                 params=self.gauss_params,
