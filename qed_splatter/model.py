@@ -317,7 +317,7 @@ class QEDSplatterModel(SplatfactoModel):
                 sensor_depth_gt = batch["depth_image"]
 
         metrics_dict = {}
-        gt_rgb = gt_img.to(self.device)  # RGB or RGBA image
+        gt_rgb = gt_img[..., :3].to(self.device)  # RGB or RGBA image
         predicted_rgb = (
             outputs["rgb"][0, ...] if outputs["rgb"].dim() == 4 else outputs["rgb"]
         )
