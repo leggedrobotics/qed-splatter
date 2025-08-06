@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Type, Union, Literal, Optional, Tuple
 
-from qed_splatter.utils.prob_backprojection import laplacian_to_3dprob_field, visualize_sparse_volume
+from qed_splatter.utils.laplacian_norm import get_laplacian_rgb, get_laplacian_depth
+from qed_splatter.utils.prob_backprojection import laplacian_projection_to_world
 
 try:
     from gsplat.rendering import rasterization
@@ -203,7 +204,6 @@ class QEDSplatterModel(SplatfactoModel):
             self.strategy_state = self.strategy.initialize_state()
         elif self.config.strategy == "pwp":
             self.strategy = PixelWiseProbStrategy(
-                prob_add_every=self.config.prob_add_every,
                 prune_opa=self.config.cull_alpha_thresh,
                 grow_grad2d=self.config.densify_grad_thresh,
                 grow_scale3d=self.config.densify_size_thresh,
@@ -413,41 +413,18 @@ class QEDSplatterModel(SplatfactoModel):
 
 
     def calculate_edge_diff(self, outputs, batch) -> np.ndarray:
+        """
+        Calculates the edge difference between the predicted RGB image and the ground truth RGB image.
+        """
         pred_img = outputs['rgb']
         gt_img = self.get_gt_img(batch['image'])
 
         with torch.no_grad():
-            pred_img_np = pred_img.squeeze(0).cpu().numpy()
-            gt_img_np = gt_img.squeeze(0).cpu().numpy()
-
-            # Apply Gaussian blur and Laplacian per channel
-            blurred_pred = np.stack([
-                cv2.GaussianBlur(pred_img_np[..., c], (0, 0), 1.0)
-                for c in range(3)
-            ], axis=-1)
-            pred_laplacian = np.stack([
-                cv2.Laplacian(blurred_pred[..., c], cv2.CV_32F, ksize=3)
-                for c in range(3)
-            ], axis=-1)
-
-            # Compute L2 norm across channels
-            pred_laplacian_norm = np.sqrt(np.sum(pred_laplacian ** 2, axis=-1))
-            # Ensure gt_img_np is blurred and laplacian is computed as well
-            blurred_gt = np.stack([
-                cv2.GaussianBlur(gt_img_np[..., c], (0, 0), 1.0)
-                for c in range(3)
-            ], axis=-1)
-            gt_laplacian = np.stack([
-                cv2.Laplacian(blurred_gt[..., c], cv2.CV_32F, ksize=3)
-                for c in range(3)
-            ], axis=-1)
-            gt_laplacian_norm = np.sqrt(np.sum(gt_laplacian ** 2, axis=-1))
-
-            pred_laplacian_clamped = np.clip(pred_laplacian_norm, 0.0, 1.0)
-            gt_laplacian_clamped = np.clip(gt_laplacian_norm, 0.0, 1.0)
+            pred_laplacian = get_laplacian_rgb(pred_img)
+            gt_laplacian = get_laplacian_rgb(gt_img)
 
             # Difference between the two Laplacians
-            edge_diff = np.maximum(gt_laplacian_clamped - pred_laplacian_clamped, 0)
+            edge_diff = np.maximum(gt_laplacian - pred_laplacian, 0)
 
             if 'mask' in batch:
                 # Set edge_diff to zero where mask is zero
@@ -456,6 +433,88 @@ class QEDSplatterModel(SplatfactoModel):
 
             return edge_diff
 
+    def new_gaussians_from_edge_diff(self, total_edge_diff: List[Tuple[Cameras, np.ndarray]]) -> None:
+        """
+        Adds new Gaussians based on edge difference maps.
+        """
+        for camera, edge_diff in total_edge_diff:
+            H, W = edge_diff.shape[:2]
+            device = self.device
+
+            # Sample points where edge_diff is high
+            edge_diff_tensor = torch.from_numpy(edge_diff).float().to(device)
+            threshold = edge_diff_tensor.mean() + edge_diff_tensor.std()
+            sample_mask = edge_diff_tensor > threshold
+
+            # Get pixel coordinates
+            sample_vu = torch.stack(torch.meshgrid(
+                torch.arange(H, device=device),
+                torch.arange(W, device=device),
+                indexing='ij'
+            ), dim=-1)
+            sample_vu = sample_vu[sample_mask]
+
+            if sample_vu.shape[0] == 0:
+                continue  # No new points to add for this image
+
+            # Get depth image and mask
+            batch = camera.metadata.get("batch", None)
+            if batch is None or "depth_image" not in batch:
+                continue
+            gt_depth = self.get_gt_img(batch["depth_image"]).squeeze(-1).to(device)
+            valid_depth_mask = (gt_depth > 0) & (gt_depth < 1e6) & ~torch.isnan(gt_depth)
+            sample_mask = sample_mask & valid_depth_mask
+            sample_vu = torch.stack(torch.meshgrid(
+                torch.arange(H, device=device),
+                torch.arange(W, device=device),
+                indexing='ij'
+            ), dim=-1)
+            sample_vu = sample_vu[sample_mask]
+
+            # Project to world coordinates
+            downscale_factor = self._get_downscale_factor()
+            camera.rescale_output_resolution(1 / downscale_factor)
+            new_pts = laplacian_projection_to_world(camera[0], gt_depth, sample_vu)
+            camera.rescale_output_resolution(downscale_factor)
+
+            # Get RGB values at sampled locations
+            gt_rgb = self.get_gt_img(batch["image"]).to(device)
+            f_dc = gt_rgb[sample_mask]
+            f_dc = RGB2SH(f_dc)
+
+            # Initialize scales
+            sampled_edge_diff = edge_diff_tensor[sample_mask]
+            scales = 1 / (2 * torch.sqrt(sampled_edge_diff))
+            scales.clamp_(1, W / 10)
+            scales = gt_depth[sample_mask] * scales / camera[0].fx
+            scales = torch.log(scales.clamp(1e-6, 1e6)).unsqueeze(-1).repeat(1, 3)
+
+            opacities = torch.logit(0.2 * torch.ones((f_dc.shape[0], 1), device=device))
+            f_rest = torch.zeros(
+                f_dc.shape[0],
+                (self.config.sh_degree + 1) * (self.config.sh_degree + 1) - 1,
+                3,
+                device=device,
+            )
+            rots = torch.zeros(f_dc.shape[0], 4, device=device)
+            rots[:, 0] = 1
+
+            # Compose new gaussians dict
+            new_gaussians = {
+                "means": new_pts,
+                "scales": scales,
+                "quats": rots,
+                "features_dc": f_dc,
+                "features_rest": f_rest,
+                "opacities": opacities,
+            }
+
+            # Cull mask for new gaussians
+            valid_gs_mask = torch.sigmoid(self.opacities).squeeze(-1) > 0.1
+            valid_gs_mask *= torch.exp(self.scales).max(dim=-1).values < self.config.cull_scale_thresh * self.scene_scale
+            self._add_new_gaussians(valid_gs_mask, new_gaussians)
+            print(f"Add {new_pts.shape[0]} new Gaussians from edge diff.")
+
     def step_post_backwards(self, pipeline: Pipeline, step):
         # Note: Function is called step_post_backward in splatfacto, to avoid a signature mismatch, we rename it here
         assert step == self.step
@@ -463,22 +522,7 @@ class QEDSplatterModel(SplatfactoModel):
         if self.step == 1500:
             total_edge_diff = self.calculate_total_edge_diff(pipeline, step)
 
-            CONSOLE.log(f"Total edge difference calculated for step {step}, length: {len(total_edge_diff)}")
-
-            sparse_volume = laplacian_to_3dprob_field(
-                camera_edgediff_map=total_edge_diff,
-            )
-
-            CONSOLE.log(f"Sparse volume created for step {step}, shape: {sparse_volume.shape}")
-
-            visualize_sparse_volume(
-                sparse_volume,
-                grid_origin=np.array([0.0, 0.0, 0.0]),
-                resolution=0.001,
-                grid_dims=np.ceil(np.array([2.0, 2.0, 2.0]) / 0.001).astype(int),
-                min_threshold=0.1,
-                max_points=50000
-            )
+            # Calculate the new gaussians here
 
         if isinstance(self.strategy, DefaultStrategy):
             self.strategy.step_post_backward(
@@ -501,23 +545,6 @@ class QEDSplatterModel(SplatfactoModel):
         elif isinstance(self.strategy, PixelWiseProbStrategy): # TODO: Might need to be moved up as inheritance of defaultStrategy
             if self.step % self.config.prob_add_every == 0:
                 total_edge_diff = self.calculate_total_edge_diff(pipeline, step)
-
-                sparse_volume = laplacian_to_3dprob_field(
-                    camera_edgediff_map=total_edge_diff,
-                )
-
-                visualize_sparse_volume(
-                    sparse_volume,
-                    grid_origin=np.array([0.0, 0.0, 0.0]),
-                    resolution=0.01,
-                    grid_dims=np.ceil(np.array([2.0, 2.0, 2.0]) / 0.01).astype(int),
-                    min_threshold=0.1,
-                    max_points=50000
-                )
-
-                #self.strategy.add_gaussians(
-                #    total_edge_diff
-                #)
 
             self.strategy.step_post_backward(
                 params=self.gauss_params,
@@ -656,35 +683,13 @@ class QEDSplatterModel(SplatfactoModel):
 
         # Laplacian computation
         with torch.no_grad():
-            rgb_np = rgb.squeeze(0).cpu().numpy()  # [H, W, 3]
-            rgb_np = np.clip(rgb_np, 0.0, 1.0)
-            if rgb_np.ndim == 3 and rgb_np.shape[2] == 3:
-                # Convert to float32
-                rgb_np = rgb_np.astype(np.float32)
-                # Apply Gaussian blur and Laplacian per channel
-                blurred = np.stack([
-                    cv2.GaussianBlur(rgb_np[..., c], (0, 0), 1.0)
-                    for c in range(3)
-                ], axis=-1)
-                rgb_laplacian = np.stack([
-                    cv2.Laplacian(blurred[..., c], cv2.CV_32F, ksize=3)
-                    for c in range(3)
-                ], axis=-1)
-                # Compute L2 norm across channels
-                rgb_laplacian_norm = np.sqrt(np.sum(rgb_laplacian ** 2, axis=-1))  # [H, W]
-                rgb_laplacian_clamped = np.clip(rgb_laplacian_norm, 0.0, 1.0)
-                rgb_laplacian_tensor = torch.from_numpy(rgb_laplacian_clamped).to(rgb.device).float()
-                rgb_laplacian_tensor = rgb_laplacian_tensor.unsqueeze(-1).repeat(1, 1, 3)  # [H, W, 3]
-            else:
-                rgb_laplacian_tensor = torch.zeros((rgb.shape[1], rgb.shape[2], 3), device=rgb.device)
+            rgb_laplacian_clamped = get_laplacian_rgb(rgb)
+            rgb_laplacian_tensor = torch.from_numpy(rgb_laplacian_clamped).to(rgb.device).float()
+            rgb_laplacian_tensor = rgb_laplacian_tensor.unsqueeze(-1).repeat(1, 1, 3)  # [H, W, 3]
 
             # Depth Laplacian computation
             if depth_im is not None:
-                depth_np = depth_im.cpu().numpy().astype(np.float32)  # [H, W]
-                depth_blurred = cv2.GaussianBlur(depth_np, (0, 0), 1.0)
-                depth_laplacian = cv2.Laplacian(depth_blurred, cv2.CV_32F, ksize=3)
-                depth_laplacian_norm = np.abs(depth_laplacian)  # [H, W]
-                depth_laplacian_clamped = np.clip(depth_laplacian_norm, 0.0, 1.0)
+                depth_laplacian_clamped = get_laplacian_depth(depth_im)
                 depth_laplacian_tensor = torch.from_numpy(depth_laplacian_clamped).to(rgb.device).float()
                 depth_laplacian_tensor = depth_laplacian_tensor.unsqueeze(-1).repeat(1, 1, 3)  # [H, W, 3]
             else:
