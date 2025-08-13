@@ -22,6 +22,7 @@ from nerfstudio.pipelines.base_pipeline import VanillaPipelineConfig
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanagerConfig, FullImageDatamanager
 
 qed_splatter_config = MethodSpecification(
+    description="QED-Splatter Config. This config is used for training the QED-Splatter model on depth datasets.",
     config=TrainerConfig(
     method_name="qed-splatter",
         steps_per_eval_image=100,
@@ -82,5 +83,4 @@ qed_splatter_config = MethodSpecification(
         viewer=ViewerConfig(num_rays_per_chunk=1 << 15),
         vis="viewer",
     ),
-    description="A clone of the splatfacto config",
 )
