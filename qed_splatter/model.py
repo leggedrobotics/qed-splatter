@@ -15,15 +15,19 @@ from nerfstudio.utils.misc import torch_compile
 import torchvision.transforms.functional as TF
 from qed_splatter.metrics import RGBMetrics, DepthMetrics
 
-@torch_compile()
+
+# Pre-create the flip tensor for get_viewmat to avoid tracing issues
+_FLIP_GSPLAT = torch.tensor([[[1, -1, -1]]], dtype=torch.float32)
+
 def get_viewmat(optimized_camera_to_world):
     """
-    function that converts c2w to gsplat world2camera matrix, using compile for some speed
+    function that converts c2w to gsplat world2camera matrix
     """
     R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
     T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
     # flip the z and y axes to align with gsplat conventions
-    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
+    flip = _FLIP_GSPLAT.to(R.device, R.dtype)
+    R = R * flip
     # analytic matrix inverse to get world2camera matrix
     R_inv = R.transpose(1, 2)
     T_inv = -torch.bmm(R_inv, T)
