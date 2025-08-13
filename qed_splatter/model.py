@@ -75,8 +75,9 @@ class QEDSplatterModelConfig(SplatfactoModelConfig):
     strategy: Literal["default", "mcmc", "pwp"] = "default"
     """The default strategy will be used if strategy is not specified. Other strategies, e.g. mcmc, can be used."""
     prob_add_every: int = 20
-    """Number of frames after which to add new Gaussians based on the probability map."""
+    """Number of frames to wait in between adding new Gaussians based on pixel-wise probability."""
     stop_gaussian_adding_at: int = 5000
+    """Stop adding new Gaussians after this many frames."""
 
 
 class QEDSplatterModel(SplatfactoModel):
@@ -401,131 +402,76 @@ class QEDSplatterModel(SplatfactoModel):
 
             return edge_diff, sample_mask
 
-
-    def calculate_total_edge_diff(self, pipeline: Pipeline, step) -> List[Tuple[Cameras, np.ndarray, torch.Tensor]]:
+    def get_new_gaussians(self, pipeline: Pipeline, step):
         """
-        Calculates the laplacian of the RGB and GT RGB images. Then subtracts the two to get the edge difference.
-        Returns a tuple of (camera, edge_diff, sample_mask).
+        Generates new Gaussians based on the edge difference between the predicted RGB image and the ground truth RGB image.
+        Returns a tuple of (new_gaussians, sample_mask).
         """
         datamanager = pipeline.datamanager
-        assert hasattr(datamanager, "fixed_indices_eval_dataloader"), (
-            "datamanager must have 'fixed_indices_eval_dataloader' attribute"
-        )
+        camera, batch = datamanager.next_train(step)
 
-        pipeline.eval()
-        dataloader = datamanager.fixed_indices_eval_dataloader
-        num_images = len(dataloader)
-        CONSOLE.log(f"Calculating edge difference for step {step} with {num_images} images")
+        outputs = self.get_outputs_for_camera(camera=camera)
+        edge_diff, sample_mask = self.calculate_edge_diff(outputs, batch)
 
-        diff_list = []
-
-        with Progress(
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TimeElapsedColumn(),
-                MofNCompleteColumn(),
-                transient=True,
-        ) as progress:
-            task = progress.add_task("[green]Calculating Edge Diff", total=num_images)
-            idx = 0
-            for camera, batch in dataloader:
-                outputs = self.get_outputs_for_camera(camera=camera)
-                edge_diff, sample_mask = self.calculate_edge_diff(
-                    outputs=outputs,
-                    batch=batch,
-                )
-                diff_list.append((camera, edge_diff, sample_mask))
-
-                progress.advance(task)
-                idx += 1
-
-        pipeline.train()
-
-        # Return the edge differences
-        return diff_list
-
-    def new_gaussians_from_edge_diff(self, pipeline: Pipeline, step):
-        """
-        Adds new Gaussians based on edge difference maps and sample mask.
-        Collects all new gaussians from all images and returns them together.
-        """
-        total_edge_diff = self.calculate_total_edge_diff(pipeline, step)
-
-        all_valid_gs_masks = []
-        all_new_gaussians = {k: [] for k in [
-            "means", "scales", "quats", "features_dc", "features_rest", "opacities"
-        ]}
-
-        for camera, edge_diff, sample_mask in total_edge_diff:
-            H, W = edge_diff.shape[:2]
-            device = self.device
-
-            # Get pixel coordinates
-            sample_vu = torch.stack(torch.meshgrid(
-                torch.arange(H, device=device),
-                torch.arange(W, device=device),
-                indexing='ij'
-            ), dim=-1)
-            sample_vu = sample_vu[sample_mask]
-
-            if sample_vu.shape[0] == 0:
-                continue  # No new points to add for this image
-
-            # Get depth image
-            batch = camera.metadata.get("batch", None)
-            if batch is None or "depth_image" not in batch:
-                continue
-            gt_depth = self.get_gt_img(batch["depth_image"]).squeeze(-1).to(device)
-
-            # Project to world coordinates
-            camera_scale_fac = self._get_downscale_factor()
-            camera.rescale_output_resolution(1 / camera_scale_fac)
-            new_pts = laplacian_projection_to_world(camera[0], gt_depth, sample_vu)
-            camera.rescale_output_resolution(camera_scale_fac)
-
-            # Get RGB values at sampled locations
-            gt_rgb = self.get_gt_img(batch["image"]).to(device)
-            f_dc = gt_rgb[sample_mask]
-            f_dc = RGB2SH(f_dc)
-
-            # Initialize scales
-            edge_diff_tensor = torch.from_numpy(edge_diff).float().to(device)
-            sampled_edge_diff = edge_diff_tensor[sample_mask]
-            scales = 1 / (2 * torch.sqrt(sampled_edge_diff))
-            scales.clamp_(1, W / 10)
-            scales = gt_depth[sample_mask] * scales / camera[0].fx
-            scales = torch.log(scales.clamp(1e-6, 1e6)).unsqueeze(-1).repeat(1, 3)
-
-            opacities = torch.logit(0.2 * torch.ones((f_dc.shape[0], 1), device=device))
-            f_rest = torch.zeros(
-                f_dc.shape[0],
-                (self.config.sh_degree + 1) * (self.config.sh_degree + 1) - 1,
-                3,
-                device=device,
-            )
-            rots = torch.zeros(f_dc.shape[0], 4, device=device)
-            rots[:, 0] = 1
-
-            # Compose new gaussians dict
-            for k, v in zip(
-                ["means", "scales", "quats", "features_dc", "features_rest", "opacities"],
-                [new_pts, scales, rots, f_dc, f_rest, opacities]
-            ):
-                all_new_gaussians[k].append(v)
-
-            # Cull mask for new gaussians
-            valid_gs_mask = torch.sigmoid(self.opacities).squeeze(-1) > 0.1
-            valid_gs_mask *= torch.exp(self.scales).max(dim=-1).values < self.config.cull_scale_thresh * self.scene_scale
-            all_valid_gs_masks.append(valid_gs_mask)
-
-        # Concatenate all collected gaussians and masks
-        if all_new_gaussians["means"]:
-            for k in all_new_gaussians:
-                all_new_gaussians[k] = torch.cat(all_new_gaussians[k], dim=0)
-            all_valid_gs_mask = torch.cat(all_valid_gs_masks, dim=0) if all_valid_gs_masks else None
-            return all_valid_gs_mask, all_new_gaussians
-        else:
+        if sample_mask.sum() == 0:
             return None, None
+
+        # Get pixel coordinates
+        H, W = edge_diff.shape[:2]
+        device = self.device
+        sample_vu = torch.stack(torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing='ij'
+        ), dim=-1)
+        sample_vu = sample_vu[sample_mask]
+
+        # Get depth image
+        gt_depth = self.get_gt_img(batch["depth_image"]).squeeze(-1).to(device)
+
+        # Project to world coordinates
+        camera_scale_fac = self._get_downscale_factor()
+        camera.rescale_output_resolution(1 / camera_scale_fac)
+        new_pts = laplacian_projection_to_world(camera[0], gt_depth, sample_vu)
+        camera.rescale_output_resolution(camera_scale_fac)
+
+        # Get RGB values at sampled locations
+        gt_rgb = self.get_gt_img(batch["image"]).to(device)
+        f_dc = gt_rgb[sample_mask]
+        f_dc = RGB2SH(f_dc)
+
+        # Initialize scales
+        edge_diff_tensor = torch.from_numpy(edge_diff).float().to(device)
+        sampled_edge_diff = edge_diff_tensor[sample_mask]
+        scales = 1 / (2 * torch.sqrt(sampled_edge_diff))
+        scales.clamp_(1, W / 10)
+        scales = gt_depth[sample_mask] * scales / camera[0].fx
+        scales = torch.log(scales.clamp(1e-6, 1e6)).unsqueeze(-1).repeat(1, 3)
+
+        opacities = torch.logit(0.2 * torch.ones((f_dc.shape[0], 1), device=device))
+        f_rest = torch.zeros(
+            f_dc.shape[0],
+            (self.config.sh_degree + 1) * (self.config.sh_degree + 1) - 1,
+            3,
+            device=device,
+        )
+        rots = torch.zeros(f_dc.shape[0], 4, device=device)
+        rots[:, 0] = 1
+
+        # Compose new gaussians dict
+        new_gaussians = {
+            "means": new_pts,
+            "scales": scales,
+            "quats": rots,
+            "features_dc": f_dc,
+            "features_rest": f_rest,
+            "opacities": opacities,
+        }
+
+        # Cull mask for new gaussians
+        valid_gs_mask = torch.sigmoid(self.opacities).squeeze(-1) > 0.1
+        valid_gs_mask *= torch.exp(self.scales).max(dim=-1).values < self.config.cull_scale_thresh * self.scene_scale
+        return valid_gs_mask, new_gaussians
 
     def step_post_backwards(self, pipeline: Pipeline, step):
         # Note: Function is called step_post_backward in splatfacto, to avoid a signature mismatch, we rename it here
@@ -550,8 +496,8 @@ class QEDSplatterModel(SplatfactoModel):
                 lr=self.schedulers["means"].get_last_lr()[0],  # the learning rate for the "means" attribute of the GS
             )
         elif isinstance(self.strategy, PixelWiseProbStrategy): # TODO: Might need to be moved up as inheritance of defaultStrategy
-            if self.step % self.config.prob_add_every == 0:
-                valid_gs_mask, new_gaussians = self.new_gaussians_from_edge_diff()
+            if self.step % self.config.prob_add_every == 0 and self.step < self.config.stop_gaussian_adding_at:
+                valid_gs_mask, new_gaussians = self.get_new_gaussians()
                 if new_gaussians is not None:
                     self.strategy.add_gaussians(
                         params=self.gauss_params,
