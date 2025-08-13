@@ -74,8 +74,9 @@ class QEDSplatterModelConfig(SplatfactoModelConfig):
     """If True, the model will output depth during training."""
     strategy: Literal["default", "mcmc", "pwp"] = "default"
     """The default strategy will be used if strategy is not specified. Other strategies, e.g. mcmc, can be used."""
-    prob_add_every: int = 500
+    prob_add_every: int = 20
     """Number of frames after which to add new Gaussians based on the probability map."""
+    stop_gaussian_adding_at: int = 5000
 
 
 class QEDSplatterModel(SplatfactoModel):
@@ -367,6 +368,40 @@ class QEDSplatterModel(SplatfactoModel):
 
         return metrics_dict
 
+    def calculate_edge_diff(self, outputs, batch) -> Tuple[np.ndarray, torch.Tensor]:
+        """
+        Calculates the edge difference between the predicted RGB image and the ground truth RGB image.
+        Returns (edge_diff, sample_mask).
+        """
+        pred_img = outputs['rgb']
+        gt_img = self.get_gt_img(batch['image'])
+
+        with torch.no_grad():
+            pred_laplacian = get_laplacian_rgb(pred_img)
+            gt_laplacian = get_laplacian_rgb(gt_img)
+
+            # Difference between the two Laplacians
+            edge_diff = np.maximum(gt_laplacian - pred_laplacian, 0)
+
+            if 'mask' in batch:
+                # Set edge_diff to zero where mask is zero
+                mask = self.get_gt_img(batch['mask']).squeeze(0).cpu().numpy()
+                edge_diff *= mask
+
+            # Calculate sample mask: high edge diff and valid depth
+            device = gt_img.device
+            edge_diff_tensor = torch.from_numpy(edge_diff).float().to(device)
+            threshold = edge_diff_tensor.mean() + edge_diff_tensor.std()
+            sample_mask = edge_diff_tensor > threshold
+
+            if "depth_image" in batch:
+                gt_depth = self.get_gt_img(batch["depth_image"]).squeeze(-1).to(device)
+                valid_depth_mask = (gt_depth > 0) & (gt_depth < 1e6) & ~torch.isnan(gt_depth)
+                sample_mask = sample_mask & valid_depth_mask
+
+            return edge_diff, sample_mask
+
+
     def calculate_total_edge_diff(self, pipeline: Pipeline, step) -> List[Tuple[Cameras, np.ndarray, torch.Tensor]]:
         """
         Calculates the laplacian of the RGB and GT RGB images. Then subtracts the two to get the edge difference.
@@ -409,43 +444,18 @@ class QEDSplatterModel(SplatfactoModel):
         # Return the edge differences
         return diff_list
 
-    def calculate_edge_diff(self, outputs, batch) -> Tuple[np.ndarray, torch.Tensor]:
-        """
-        Calculates the edge difference between the predicted RGB image and the ground truth RGB image.
-        Returns (edge_diff, sample_mask).
-        """
-        pred_img = outputs['rgb']
-        gt_img = self.get_gt_img(batch['image'])
-
-        with torch.no_grad():
-            pred_laplacian = get_laplacian_rgb(pred_img)
-            gt_laplacian = get_laplacian_rgb(gt_img)
-
-            # Difference between the two Laplacians
-            edge_diff = np.maximum(gt_laplacian - pred_laplacian, 0)
-
-            if 'mask' in batch:
-                # Set edge_diff to zero where mask is zero
-                mask = self.get_gt_img(batch['mask']).squeeze(0).cpu().numpy()
-                edge_diff *= mask
-
-            # Calculate sample mask: high edge diff and valid depth
-            device = gt_img.device
-            edge_diff_tensor = torch.from_numpy(edge_diff).float().to(device)
-            threshold = edge_diff_tensor.mean() + edge_diff_tensor.std()
-            sample_mask = edge_diff_tensor > threshold
-
-            if "depth_image" in batch:
-                gt_depth = self.get_gt_img(batch["depth_image"]).squeeze(-1).to(device)
-                valid_depth_mask = (gt_depth > 0) & (gt_depth < 1e6) & ~torch.isnan(gt_depth)
-                sample_mask = sample_mask & valid_depth_mask
-
-            return edge_diff, sample_mask
-
-    def new_gaussians_from_edge_diff(self, total_edge_diff: List[Tuple[Cameras, np.ndarray, torch.Tensor]]):
+    def new_gaussians_from_edge_diff(self, pipeline: Pipeline, step):
         """
         Adds new Gaussians based on edge difference maps and sample mask.
+        Collects all new gaussians from all images and returns them together.
         """
+        total_edge_diff = self.calculate_total_edge_diff(pipeline, step)
+
+        all_valid_gs_masks = []
+        all_new_gaussians = {k: [] for k in [
+            "means", "scales", "quats", "features_dc", "features_rest", "opacities"
+        ]}
+
         for camera, edge_diff, sample_mask in total_edge_diff:
             H, W = edge_diff.shape[:2]
             device = self.device
@@ -468,10 +478,10 @@ class QEDSplatterModel(SplatfactoModel):
             gt_depth = self.get_gt_img(batch["depth_image"]).squeeze(-1).to(device)
 
             # Project to world coordinates
-            downscale_factor = self._get_downscale_factor()
-            camera.rescale_output_resolution(1 / downscale_factor)
+            camera_scale_fac = self._get_downscale_factor()
+            camera.rescale_output_resolution(1 / camera_scale_fac)
             new_pts = laplacian_projection_to_world(camera[0], gt_depth, sample_vu)
-            camera.rescale_output_resolution(downscale_factor)
+            camera.rescale_output_resolution(camera_scale_fac)
 
             # Get RGB values at sampled locations
             gt_rgb = self.get_gt_img(batch["image"]).to(device)
@@ -497,19 +507,25 @@ class QEDSplatterModel(SplatfactoModel):
             rots[:, 0] = 1
 
             # Compose new gaussians dict
-            new_gaussians = {
-                "means": new_pts,
-                "scales": scales,
-                "quats": rots,
-                "features_dc": f_dc,
-                "features_rest": f_rest,
-                "opacities": opacities,
-            }
+            for k, v in zip(
+                ["means", "scales", "quats", "features_dc", "features_rest", "opacities"],
+                [new_pts, scales, rots, f_dc, f_rest, opacities]
+            ):
+                all_new_gaussians[k].append(v)
 
             # Cull mask for new gaussians
             valid_gs_mask = torch.sigmoid(self.opacities).squeeze(-1) > 0.1
             valid_gs_mask *= torch.exp(self.scales).max(dim=-1).values < self.config.cull_scale_thresh * self.scene_scale
-            return valid_gs_mask, new_gaussians
+            all_valid_gs_masks.append(valid_gs_mask)
+
+        # Concatenate all collected gaussians and masks
+        if all_new_gaussians["means"]:
+            for k in all_new_gaussians:
+                all_new_gaussians[k] = torch.cat(all_new_gaussians[k], dim=0)
+            all_valid_gs_mask = torch.cat(all_valid_gs_masks, dim=0) if all_valid_gs_masks else None
+            return all_valid_gs_mask, all_new_gaussians
+        else:
+            return None, None
 
     def step_post_backwards(self, pipeline: Pipeline, step):
         # Note: Function is called step_post_backward in splatfacto, to avoid a signature mismatch, we rename it here
@@ -535,8 +551,7 @@ class QEDSplatterModel(SplatfactoModel):
             )
         elif isinstance(self.strategy, PixelWiseProbStrategy): # TODO: Might need to be moved up as inheritance of defaultStrategy
             if self.step % self.config.prob_add_every == 0:
-                total_edge_diff = self.calculate_total_edge_diff(pipeline, step)
-                valid_gs_mask, new_gaussians = self.new_gaussians_from_edge_diff(total_edge_diff)
+                valid_gs_mask, new_gaussians = self.new_gaussians_from_edge_diff()
                 if new_gaussians is not None:
                     self.strategy.add_gaussians(
                         params=self.gauss_params,
