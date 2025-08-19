@@ -44,6 +44,7 @@ class QEDSplatterModelConfig(SplatfactoModelConfig):
     depth_lambda: float = 0.2  # Weight for depth loss, found 0.2 to 0.3 to work well
     # random_scale: float = 100.0  # Random scale for the gaussians, set to 1 if you enable scaling
     output_depth_during_training: bool = True
+    # use_bilateral_grid: bool = False  # Needs to be added for nerfstudio 1.1.3
 
 
 class QEDSplatterModel(SplatfactoModel):
