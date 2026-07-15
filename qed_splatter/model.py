@@ -96,8 +96,13 @@ class QEDSplatterModel(SplatfactoModel):
             depth_out = depth_out * mask
             depth_batch = depth_batch * mask
 
-        # Create a validity mask: only consider finite values (i.e., exclude NaN, +Inf, -Inf)
-        valid_mask = torch.isfinite(depth_out) & torch.isfinite(depth_batch)
+        # Create a validity mask: only consider finite, non-zero GT depth
+        # (zeros typically mark invalid / missing depth)
+        valid_mask = (
+            torch.isfinite(depth_out)
+            & torch.isfinite(depth_batch)
+            & (depth_batch > 0.0)
+        )
 
         # Apply the mask
         valid_depth_out = depth_out[valid_mask]
