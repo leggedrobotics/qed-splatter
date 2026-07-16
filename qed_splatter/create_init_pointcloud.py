@@ -173,7 +173,8 @@ class Args:
     """Create an initialization point cloud from dataset depth maps."""
 
     data: Path
-    """Path to the Nerfstudio dataset directory containing transforms.json."""
+    """Dataset directory, or path to transforms.json."""
+
     depth_unit_scale_factor: float = 0.001
     """Scale raw depth values to meters (0.001 for millimeter depth)."""
     output_name: str = "sparse_pc.ply"
@@ -192,10 +193,20 @@ class Args:
     """If True, set transforms.json ply_file_path to the output PLY."""
 
 
+def _resolve_dataset_path(data: Path) -> Path:
+    """Accept a dataset directory or a path to transforms.json."""
+    path = data.expanduser().resolve()
+    if path.is_file() and path.name == "transforms.json":
+        return path.parent
+    if path.is_dir():
+        return path
+    raise ValueError(
+        f"Expected a dataset directory or transforms.json, got: {data}"
+    )
+
+
 def main(args: Args) -> None:
-    dataset_path = args.data.expanduser().resolve()
-    if not dataset_path.is_dir():
-        raise NotADirectoryError(f"Dataset path is not a directory: {dataset_path}")
+    dataset_path = _resolve_dataset_path(args.data)
 
     output_path = dataset_path / args.output_name
     pointcloud = create_pointcloud_from_transforms(
@@ -224,7 +235,7 @@ def main(args: Args) -> None:
 
 def entrypoint() -> None:
     """CLI entrypoint registered in pyproject.toml."""
-    tyro.cli(main)
+    main(tyro.cli(Args))
 
 
 if __name__ == "__main__":
