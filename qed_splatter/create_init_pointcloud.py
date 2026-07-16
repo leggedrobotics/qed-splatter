@@ -3,11 +3,16 @@
 The output PLY is written in the same OpenGL / Nerfstudio world coordinates as
 ``transforms.json`` camera poses, so ``load_3D_points=True`` can use it directly
 via ``ply_file_path``.
+
+Per-frame backprojections and tree-merge intermediates are written to disk so
+large datasets do not need to keep all clouds in memory.
 """
 
 from __future__ import annotations
 
+import gc
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -16,27 +21,6 @@ import numpy as np
 import open3d as o3d
 import tyro
 from PIL import Image
-
-
-def tree_merge_pointclouds(
-    pointclouds: List[o3d.t.geometry.PointCloud],
-    voxel_size: float = 0.03,
-    max_points: int = 2_000_000,
-) -> o3d.t.geometry.PointCloud:
-    """Merge point clouds pairwise for O(log n) runtime."""
-    merged = pointclouds
-    while len(merged) > 1:
-        next_level = []
-        for i in range(0, len(merged), 2):
-            if i + 1 < len(merged):
-                pc = merged[i] + merged[i + 1]
-                if pc.point.positions.shape[0] > max_points:
-                    pc = pc.voxel_down_sample(voxel_size=voxel_size)
-                next_level.append(pc)
-            else:
-                next_level.append(merged[i])
-        merged = next_level
-    return merged[0]
 
 
 def _load_depth(path: Path) -> np.ndarray:
@@ -81,16 +65,159 @@ def _opengl_c2w_to_opencv_w2c(c2w_opengl: np.ndarray) -> np.ndarray:
     return np.linalg.inv(c2w).astype(np.float32)
 
 
+def _write_pointcloud(path: Path, pcd: o3d.t.geometry.PointCloud) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    o3d.t.io.write_point_cloud(str(path), pcd)
+
+
+def _read_pointcloud(path: Path) -> o3d.t.geometry.PointCloud:
+    pcd = o3d.t.io.read_point_cloud(str(path))
+    if "positions" not in pcd.point:
+        raise RuntimeError(f"Failed to read point cloud: {path}")
+    return pcd
+
+
+def _maybe_downsample(
+    pcd: o3d.t.geometry.PointCloud,
+    voxel_size: float,
+    max_points: int,
+) -> o3d.t.geometry.PointCloud:
+    if pcd.point.positions.shape[0] > max_points:
+        pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
+    return pcd
+
+
+def tree_merge_pointclouds_on_disk(
+    ply_paths: List[Path],
+    merge_dir: Path,
+    voxel_size: float = 0.03,
+    max_points: int = 2_000_000,
+) -> Path:
+    """Pairwise merge PLYs from disk, writing each level to ``merge_dir``."""
+    merge_dir.mkdir(parents=True, exist_ok=True)
+    current = list(ply_paths)
+    level = 0
+
+    while len(current) > 1:
+        level_dir = merge_dir / f"level_{level:03d}"
+        level_dir.mkdir(parents=True, exist_ok=True)
+        next_level: List[Path] = []
+        print(f"Tree-merge level {level}: {len(current)} clouds")
+
+        for i in range(0, len(current), 2):
+            out_path = level_dir / f"merged_{i // 2:06d}.ply"
+            if out_path.exists():
+                print(f"  Reusing {out_path}")
+                next_level.append(out_path)
+                continue
+
+            if i + 1 < len(current):
+                left = _read_pointcloud(current[i])
+                right = _read_pointcloud(current[i + 1])
+                merged = left + right
+                del left, right
+                merged = _maybe_downsample(merged, voxel_size=voxel_size, max_points=max_points)
+                _write_pointcloud(out_path, merged)
+                n_points = int(merged.point.positions.shape[0])
+                del merged
+                gc.collect()
+                print(f"  Wrote {out_path} ({n_points} points)")
+            else:
+                # Odd one out: copy/link path forward without loading if possible
+                shutil.copy2(current[i], out_path)
+                print(f"  Carried forward {current[i]} -> {out_path}")
+
+            next_level.append(out_path)
+
+        current = next_level
+        level += 1
+
+    return current[0]
+
+
+def backproject_frame(
+    dataset_path: Path,
+    contents: dict,
+    frame: dict,
+    depth_unit_scale_factor: float,
+    depth_max: float,
+    stride: int,
+    frame_voxel_size: Optional[float],
+) -> Optional[o3d.t.geometry.PointCloud]:
+    """Backproject one frame; return None if there is no valid depth."""
+    if "depth_file_path" not in frame:
+        return None
+
+    depth_path = dataset_path / frame["depth_file_path"]
+    image_path = dataset_path / frame["file_path"]
+    print(f"Backprojecting {depth_path}")
+
+    depth = _load_depth(depth_path) * depth_unit_scale_factor
+    depth[~np.isfinite(depth)] = 0.0
+    depth[depth <= 0.0] = 0.0
+    depth = np.ascontiguousarray(depth, dtype=np.float32)
+
+    if not np.any(depth > 0.0):
+        print(f"  Skipping frame with no valid depth: {depth_path}")
+        return None
+
+    c2w = np.array(frame["transform_matrix"], dtype=np.float64)
+    w2c = _opengl_c2w_to_opencv_w2c(c2w)
+    intrinsic = _frame_intrinsics(contents, frame)
+
+    depth_image = o3d.t.geometry.Image(o3d.core.Tensor(depth))
+    intrinsic_tensor = o3d.core.Tensor(intrinsic)
+    extrinsic_tensor = o3d.core.Tensor(w2c)
+
+    color = _load_color(image_path)
+    if color is not None and color.shape[:2] == depth.shape[:2]:
+        color_image = o3d.t.geometry.Image(o3d.core.Tensor(color))
+        rgbd = o3d.t.geometry.RGBDImage(color_image, depth_image)
+        pcd = o3d.t.geometry.PointCloud.create_from_rgbd_image(
+            rgbd,
+            intrinsic_tensor,
+            extrinsic_tensor,
+            depth_scale=1.0,
+            depth_max=depth_max,
+            stride=stride,
+            with_normals=False,
+        )
+        del color, color_image, rgbd
+    else:
+        pcd = o3d.t.geometry.PointCloud.create_from_depth_image(
+            depth_image,
+            intrinsic_tensor,
+            extrinsic_tensor,
+            depth_scale=1.0,
+            depth_max=depth_max,
+            stride=stride,
+            with_normals=False,
+        )
+
+    del depth, depth_image
+
+    if pcd.point.positions.shape[0] == 0:
+        print(f"  Skipping empty point cloud for {depth_path}")
+        return None
+
+    if frame_voxel_size is not None and frame_voxel_size > 0:
+        pcd = pcd.voxel_down_sample(voxel_size=frame_voxel_size)
+
+    return pcd
+
+
 def create_pointcloud_from_transforms(
     dataset_path: Path,
+    cache_dir: Path,
     depth_unit_scale_factor: float = 0.001,
     voxel_size: float = 0.05,
     merge_voxel_size: float = 0.03,
+    frame_voxel_size: Optional[float] = 0.05,
     max_points: int = 2_000_000,
     depth_max: float = 100.0,
     stride: int = 1,
 ) -> o3d.t.geometry.PointCloud:
-    """Backproject depths from ``transforms.json`` into a merged point cloud."""
+    """Backproject depths to disk, then tree-merge from disk into one cloud."""
     transforms_path = dataset_path / "transforms.json"
     if not transforms_path.exists():
         raise FileNotFoundError(f"No transforms.json found at {transforms_path}")
@@ -98,72 +225,53 @@ def create_pointcloud_from_transforms(
     with open(transforms_path, encoding="utf-8") as f:
         contents = json.load(f)
 
-    frames = contents["frames"]
-    pointclouds: List[o3d.t.geometry.PointCloud] = []
+    frames_dir = cache_dir / "frames"
+    merge_dir = cache_dir / "merge"
+    frames_dir.mkdir(parents=True, exist_ok=True)
 
-    for frame in frames:
+    frame_paths: List[Path] = []
+    frames = contents["frames"]
+    for idx, frame in enumerate(frames):
         if "depth_file_path" not in frame:
             continue
 
-        depth_path = dataset_path / frame["depth_file_path"]
-        image_path = dataset_path / frame["file_path"]
-        print(f"Backprojecting {depth_path}")
-
-        depth = _load_depth(depth_path) * depth_unit_scale_factor
-        # Invalid / missing depth: Open3D ignores zeros
-        depth[~np.isfinite(depth)] = 0.0
-        depth[depth <= 0.0] = 0.0
-        depth = np.ascontiguousarray(depth, dtype=np.float32)
-
-        if not np.any(depth > 0.0):
-            print(f"  Skipping frame with no valid depth: {depth_path}")
+        out_path = frames_dir / f"frame_{idx:06d}.ply"
+        if out_path.exists():
+            print(f"Reusing cached frame {out_path}")
+            frame_paths.append(out_path)
             continue
 
-        c2w = np.array(frame["transform_matrix"], dtype=np.float64)
-        w2c = _opengl_c2w_to_opencv_w2c(c2w)
-        intrinsic = _frame_intrinsics(contents, frame)
-
-        depth_image = o3d.t.geometry.Image(o3d.core.Tensor(depth))
-        intrinsic_tensor = o3d.core.Tensor(intrinsic)
-        extrinsic_tensor = o3d.core.Tensor(w2c)
-
-        color = _load_color(image_path)
-        if color is not None and color.shape[:2] == depth.shape[:2]:
-            color_image = o3d.t.geometry.Image(o3d.core.Tensor(color))
-            rgbd = o3d.t.geometry.RGBDImage(color_image, depth_image)
-            pcd = o3d.t.geometry.PointCloud.create_from_rgbd_image(
-                rgbd,
-                intrinsic_tensor,
-                extrinsic_tensor,
-                depth_scale=1.0,
-                depth_max=depth_max,
-                stride=stride,
-                with_normals=False,
-            )
-        else:
-            pcd = o3d.t.geometry.PointCloud.create_from_depth_image(
-                depth_image,
-                intrinsic_tensor,
-                extrinsic_tensor,
-                depth_scale=1.0,
-                depth_max=depth_max,
-                stride=stride,
-                with_normals=False,
-            )
-
-        if pcd.point.positions.shape[0] == 0:
-            print(f"  Skipping empty point cloud for {depth_path}")
+        pcd = backproject_frame(
+            dataset_path=dataset_path,
+            contents=contents,
+            frame=frame,
+            depth_unit_scale_factor=depth_unit_scale_factor,
+            depth_max=depth_max,
+            stride=stride,
+            frame_voxel_size=frame_voxel_size,
+        )
+        if pcd is None:
             continue
 
-        pointclouds.append(pcd)
+        n_points = int(pcd.point.positions.shape[0])
+        _write_pointcloud(out_path, pcd)
+        print(f"  Saved {out_path} ({n_points} points)")
+        del pcd
+        gc.collect()
+        frame_paths.append(out_path)
 
-    if not pointclouds:
+    if not frame_paths:
         raise RuntimeError("No valid point clouds could be generated from the dataset.")
 
-    print(f"Merging {len(pointclouds)} point clouds...")
-    pointcloud = tree_merge_pointclouds(
-        pointclouds, voxel_size=merge_voxel_size, max_points=max_points
+    print(f"Merging {len(frame_paths)} cached frame point clouds...")
+    merged_path = tree_merge_pointclouds_on_disk(
+        frame_paths,
+        merge_dir=merge_dir,
+        voxel_size=merge_voxel_size,
+        max_points=max_points,
     )
+
+    pointcloud = _read_pointcloud(merged_path)
     pointcloud = pointcloud.voxel_down_sample(voxel_size=voxel_size)
     return pointcloud
 
@@ -179,16 +287,22 @@ class Args:
     """Scale raw depth values to meters (0.001 for millimeter depth)."""
     output_name: str = "sparse_pc.ply"
     """Output PLY filename written into the dataset directory."""
+    cache_dir: Optional[Path] = None
+    """Directory for per-frame and merge intermediates. Default: <data>/init_pc_cache."""
+    keep_cache: bool = True
+    """Keep per-frame / merge cache after writing the final PLY."""
     voxel_size: float = 0.05
     """Final voxel downsample size after merging."""
     merge_voxel_size: float = 0.03
     """Voxel size used while tree-merging intermediate clouds."""
+    frame_voxel_size: Optional[float] = 0.05
+    """Voxel downsample each frame before writing to disk. Set null to disable."""
     max_points: int = 2_000_000
     """Downsample during merge when a cloud exceeds this many points."""
     depth_max: float = 100.0
     """Maximum depth (meters) to keep during backprojection."""
-    stride: int = 1
-    """Pixel stride when converting depth to points (1 = every pixel)."""
+    stride: int = 4
+    """Pixel stride when converting depth to points (higher = less memory)."""
     update_transforms: bool = True
     """If True, set transforms.json ply_file_path to the output PLY."""
 
@@ -207,13 +321,20 @@ def _resolve_dataset_path(data: Path) -> Path:
 
 def main(args: Args) -> None:
     dataset_path = _resolve_dataset_path(args.data)
+    cache_dir = (
+        args.cache_dir.expanduser().resolve()
+        if args.cache_dir is not None
+        else dataset_path / "init_pc_cache"
+    )
 
     output_path = dataset_path / args.output_name
     pointcloud = create_pointcloud_from_transforms(
         dataset_path=dataset_path,
+        cache_dir=cache_dir,
         depth_unit_scale_factor=args.depth_unit_scale_factor,
         voxel_size=args.voxel_size,
         merge_voxel_size=args.merge_voxel_size,
+        frame_voxel_size=args.frame_voxel_size,
         max_points=args.max_points,
         depth_max=args.depth_max,
         stride=args.stride,
@@ -222,6 +343,8 @@ def main(args: Args) -> None:
     num_points = int(pointcloud.point.positions.shape[0])
     print(f"Writing {num_points} points to {output_path}")
     o3d.t.io.write_point_cloud(str(output_path), pointcloud)
+    del pointcloud
+    gc.collect()
 
     if args.update_transforms:
         transforms_path = dataset_path / "transforms.json"
@@ -231,6 +354,12 @@ def main(args: Args) -> None:
         with open(transforms_path, "w", encoding="utf-8") as f:
             json.dump(contents, f, indent=4)
         print(f"Updated {transforms_path} with ply_file_path={args.output_name}")
+
+    if not args.keep_cache and cache_dir.exists():
+        shutil.rmtree(cache_dir)
+        print(f"Removed cache directory {cache_dir}")
+    else:
+        print(f"Cache kept at {cache_dir}")
 
 
 def entrypoint() -> None:
