@@ -271,10 +271,13 @@ def _project_points(
     pts_h = np.concatenate([positions.astype(np.float32), ones], axis=1)
     pts_cam = pts_h @ w2c.T
     z = pts_cam[:, 2]
-    # Avoid divide-by-zero; invalid depths are filtered later.
-    z_safe = np.where(z > 1e-6, z, 1e-6)
+    # Only project points in front of the camera; others become non-finite.
+    valid_z = np.isfinite(z) & (z > 1e-6)
+    z_safe = np.where(valid_z, z, 1.0)
     u = intrinsic[0, 0] * (pts_cam[:, 0] / z_safe) + intrinsic[0, 2]
     v = intrinsic[1, 1] * (pts_cam[:, 1] / z_safe) + intrinsic[1, 2]
+    u = np.where(valid_z & np.isfinite(u), u, np.nan)
+    v = np.where(valid_z & np.isfinite(v), v, np.nan)
     return u, v, z
 
 
@@ -320,22 +323,31 @@ def colorize_pointcloud(
         intrinsic = _frame_intrinsics(contents, frame)
         u, v, z = _project_points(positions, w2c, intrinsic)
 
-        ui = np.rint(u).astype(np.int32)
-        vi = np.rint(v).astype(np.int32)
-        valid = (
-            (z > 0.0)
+        # Filter before casting so NaN/Inf/huge coords never hit int32.
+        candidate = (
+            np.isfinite(u)
+            & np.isfinite(v)
+            & np.isfinite(z)
+            & (z > 0.0)
             & (z <= depth_max)
-            & (ui >= 0)
-            & (ui < w)
-            & (vi >= 0)
-            & (vi < h)
+            & (u >= -0.5)
+            & (u < (w - 0.5))
+            & (v >= -0.5)
+            & (v < (h - 0.5))
         )
-        if not np.any(valid):
+        if not np.any(candidate):
             continue
 
-        valid_idx = np.flatnonzero(valid)
-        ui_v = ui[valid_idx]
-        vi_v = vi[valid_idx]
+        valid_idx = np.flatnonzero(candidate)
+        ui_v = np.rint(u[valid_idx]).astype(np.int32)
+        vi_v = np.rint(v[valid_idx]).astype(np.int32)
+        in_bounds = (ui_v >= 0) & (ui_v < w) & (vi_v >= 0) & (vi_v < h)
+        if not np.any(in_bounds):
+            continue
+
+        valid_idx = valid_idx[in_bounds]
+        ui_v = ui_v[in_bounds]
+        vi_v = vi_v[in_bounds]
         z_v = z[valid_idx]
         measured = depth[vi_v, ui_v]
         tol = np.maximum(depth_tolerance, depth_tolerance_rel * z_v)
