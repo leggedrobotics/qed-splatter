@@ -18,9 +18,10 @@ class RGBHardPruneConfig(HardPruneConfig):
 
 
 class RGBHardPruner(HardPruner):
-    def output_stem(self) -> str:
+    def default_output_filename(self) -> str:
         suffix = str(self.cfg.pruning_ratio).replace("0.", "")
-        return f"{self.cfg.load_config.parent.name}_rgb_pruned_{suffix}"
+        ext = "ckpt" if self.cfg.output_format == "ckpt" else "ply"
+        return f"{self.cfg.load_config.parent.name}_rgb_pruned_{suffix}.{ext}"
 
     def compute_scores(self) -> torch.Tensor:
         scores = torch.zeros(len(self.model.means), device=self.device)

@@ -48,16 +48,16 @@ pip install -e .
 
 ### RGB
 ```
-qed-rgb-prune --load-config outputs/park/qed-splatter/*/config.yml --pruning-ratio 0.1 --result-dir pruned
+qed-rgb-prune --load-config outputs/park/qed-splatter/*/config.yml --output-dir exports/ --pruning-ratio 0.1
 ```
 
 ### Depth
 Requires a depth-aware run (e.g. qed-splatter).
 ```
-qed-depth-prune --load-config outputs/park/qed-splatter/*/config.yml --pruning-ratio 0.1 --result-dir pruned
+qed-depth-prune --load-config outputs/park/qed-splatter/*/config.yml --output-dir exports/ --pruning-ratio 0.1
 ```
 
-Useful flags: ``--eval-only``, ``--output-format {ply,ckpt}``, ``--ssim-lambda``.
+Useful flags: ``--output-filename``, ``--output-format {ply,ckpt}``, ``--eval-only``, ``--ssim-lambda``.
 
 #### Known Issues
 For the Park scene it tries to generate black gaussians to cover the sky. The entire scene is encased in these gaussians.

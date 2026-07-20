@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Type
+from typing import Dict, Literal, Optional, Type
 
 import numpy as np
 import torch
@@ -29,16 +29,18 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 
 @dataclass
 class HardPruneConfig:
-    """Shared CLI config for hard pruning."""
+    """Base config matching nerfstudio's ``Exporter`` argument style."""
 
     load_config: Path
-    """Path to the trained nerfstudio config.yml."""
-    result_dir: Path = Path("./pruned/")
-    """Directory for pruned outputs."""
+    """Path to the config YAML file."""
+    output_dir: Path
+    """Path to the output directory."""
+    output_filename: Optional[str] = None
+    """Name of the output file. If unset, derived from the config path and pruning ratio."""
     pruning_ratio: float = 0.1
     """Fraction of gaussians to remove (lowest scores)."""
-    output_format: str = "ply"
-    """``ply`` (nerfstudio gaussian-splat) or ``ckpt``."""
+    output_format: Literal["ply", "ckpt"] = "ply"
+    """Export format: nerfstudio gaussian-splat PLY, or a checkpoint."""
     ssim_lambda: float = 0.2
     """Weight of SSIM vs L1 in the scoring loss."""
     eval_only: bool = False
@@ -53,7 +55,7 @@ class HardPruner(ABC):
 
     def __init__(self, cfg: HardPruneConfig) -> None:
         self.cfg = cfg
-        self.cfg.result_dir.mkdir(parents=True, exist_ok=True)
+        self.cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.config, self.pipeline, self.checkpoint_path, self.step = eval_setup(
             cfg.load_config, test_mode="val"
@@ -155,20 +157,27 @@ class HardPruner(ABC):
                 self.model.gauss_params[name].requires_grad_(True)
 
     def save(self) -> None:
-        stem = self.output_stem()
+        path = self.output_path()
         if self.cfg.output_format == "ply":
-            path = self.cfg.result_dir / f"{stem}.ply"
+            if path.suffix != ".ply":
+                path = path.with_suffix(".ply")
             export_gaussian_ply(self.model, path)
-            CONSOLE.print(f"Wrote {path}")
         elif self.cfg.output_format == "ckpt":
-            path = self.cfg.result_dir / f"{stem}.ckpt"
+            if path.suffix != ".ckpt":
+                path = path.with_suffix(".ckpt")
             save_pruned_ckpt(self.pipeline, self.step, path)
-            CONSOLE.print(f"Wrote {path}")
         else:
             raise ValueError(f"Unknown output_format: {self.cfg.output_format}")
+        CONSOLE.print(f"Wrote {path}")
+
+    def output_path(self) -> Path:
+        if self.cfg.output_filename is not None:
+            return self.cfg.output_dir / self.cfg.output_filename
+        return self.cfg.output_dir / self.default_output_filename()
 
     @abstractmethod
-    def output_stem(self) -> str:
+    def default_output_filename(self) -> str:
+        """Default filename when ``output_filename`` is not set."""
         ...
 
 
