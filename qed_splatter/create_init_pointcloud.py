@@ -375,12 +375,17 @@ def colorize_pointcloud(
     if n_colored == 0:
         raise RuntimeError("No points received color from any RGB frame.")
 
-    colors = np.zeros((n_points, 3), dtype=np.float32)
-    colors[colored] = (color_sum[colored] / color_count[colored, None]).astype(np.float32)
+    colors = np.zeros((n_points, 3), dtype=np.uint8)
+    colors[colored] = (
+        (color_sum[colored] / color_count[colored, None] * 255.0)
+        .clip(0.0, 255.0)
+        .astype(np.uint8)
+    )
     # Unobserved points stay black; splatfacto can still optimize them.
     print(f"Colored {n_colored}/{n_points} points "
           f"({100.0 * n_colored / n_points:.1f}%)")
 
+    # Store uchar colors so nerfstudio's legacy PLY reader gets correct RGB values.
     pcd.point["colors"] = o3d.core.Tensor(colors)
     return pcd
 
