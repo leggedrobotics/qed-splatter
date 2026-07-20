@@ -35,118 +35,29 @@ ns-train qed-splatter --data [PATH]
 
 ## Pruning Extension
 
-The pruning extension provides tools to reduce the number of Gaussians in order to improve rendering speed. There are two main types of pruners available:
+Post-training hard pruners that reduce gaussian count. They follow the same pattern as
+[dn-splatter's mesh export](https://github.com/maturk/dn-splatter/blob/main/dn_splatter/export_mesh.py):
 
-- **Soft pruners** gradually reduce the number of Gaussians during training.
-- **Hard pruners** are post-processing tools applied after training is complete.
+1. ``eval_setup(--load-config)`` loads the training config, dataparser, and checkpoint
+2. Scoring uses ``SplatfactoModel.get_outputs`` over the train cameras
+3. Export uses nerfstudio's ``ExportGaussianSplat.write_ply`` (or a ``.ckpt``)
 
-Each pruner computes a *pruning score* to evaluate the importance of individual Gaussians. The least important Gaussians are then removed.
-
-Currently, two hard pruning scripts are available: `rgb_hard_pruner` and `depth_hard_pruner`.
-
-### RGB_hard_pruner
-This pruner uses RGB loss to compute a pruning score to do hard pruning.
 ```
-python3 RGB_hard_pruner.py default --data-dir datasets/park --ckpt results/park/step-000029999.ckpt --pruning-ratio 0.1 --result-dir output
-
---eval-only (only evaluates, no saving, no pruning)  
---pruning-ratio 0.0 (no pruning, saved in new format)  
---output-format (ply (default), ckpt (nerfstudio), pt (gsplat))
+pip install -e .
 ```
 
-## 📥 Required Arguments
-
-| Argument          | Description                                                                 |
-|-------------------|-----------------------------------------------------------------------------|
-| `default`         | Specifies the run configuration.   |
-| `--data-dir`      | Path to the directory containing `transforms.json` (camera poses and intrinsics) and images (RGB, Depth)· |
-| `--ckpt`          | Path to the pretrained model checkpoint (e.g., `results/park/step-XXXXX.ckpt`). |
-| `--pruning-ratio` | Float between `0.0` and `1.0`. Proportion of the model to prune. Example: `0.1` = keep 90%. |
-| `--result-dir`    | Directory where the output (pruned model) will be saved.                |
-
-
-## Input Format
-
-The code supports multiple output formats. The format is detected automatically. 
-- `ply` : expects a Nerfstudio format for the transforms. 
-- `ckpt` : expects a Nerfstudio format for the transforms. 
-- `pt` : expects a gsplat format for the transforms. 
-
-
-
-### GSPlat Dataset Format
-
-This repository expects datasets to be structured in a COLMAP-like format, which includes camera parameters, image poses, and optionally 3D points. This format is commonly used for 3D reconstruction and novel view synthesis tasks.
-
-#### 📁 Folder Structure
-
-Your dataset should be organized like this:
+### RGB
 ```
-data_dir/
-├── images/               # All input images
-│   ├── img1.jpg
-│   ├── img2.png
-│   └── ...
-├── sparse/               # Sparse reconstruction data (from COLMAP)
-│   ├── cameras.bin       # Camera intrinsics
-│   ├── images.bin        # Image poses (extrinsic) and filenames
-│   └── points3D.bin      # Optional: 3D point cloud
+qed-rgb-prune --load-config outputs/park/qed-splatter/*/config.yml --pruning-ratio 0.1 --result-dir pruned
 ```
 
-### Nerfstudio Dataset Format
-
-#### 🔧 `transforms.json` File
-
-This file must include the following:
-
-- Intrinsic camera parameters:
-  - `"fl_x"`, `"fl_y"`: focal lengths
-  - `"cx"`, `"cy"`: principal point
-  - `"w"`, `"h"`: image dimensions
-
-- A list of frames, each containing:
-  - `file_path`: path to the RGB image (relative to `your_dataset/`)
-  - `depth_file_path`: path to the depth map (relative to `your_dataset/`)
-  - `transform_matrix`: 4x4 camera-to-world matrix
-
-**Example:**
-```json
-{
-    "w": 1920,
-    "h": 1080,
-    "fl_x": 2198.997802734375,
-    "fl_y": 2198.997802734375,
-    "cx": 960.0,
-    "cy": 540.0,
-    "k1": 0,
-    "k2": 0,
-    "p1": 0,
-    "p2": 0,
-  "frames": [
-    {
-      "file_path": "images/frame_0000.png",
-      "depth_file_path": "depths/frame_0000.png",
-      "transform_matrix": [[1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,0,1]]
-    },
-    {
-      "file_path": "images/frame_0001.png",
-      "depth_file_path": "depths/frame_0001.png",
-      "transform_matrix": [[0,2,0,0], [0,1,3,0], [0,0,1,0], [0,5,0,1]]
-    }
-  ]
-}
+### Depth
+Requires a depth-aware run (e.g. qed-splatter).
+```
+qed-depth-prune --load-config outputs/park/qed-splatter/*/config.yml --pruning-ratio 0.1 --result-dir pruned
 ```
 
-
-### Depth_hard_pruner
-This pruner uses depth loss to compute a pruning score to do hard pruning. It works analogously to the RGB hard pruner but not all features are available.
-```
-python3 depth_hard_pruner.py default --data-dir datasets/park --ckpt results/park/step-000029999.ckpt --pruning-ratio 0.1 --result-dir output
-
---eval-only (only evaluates, no saving, no pruning)  
---pruning-ratio 0.0 (no pruning, saved in new format)  
---output-format (ply (default), ckpt (nerfstudio), pt (gsplat))
-```
+Useful flags: ``--eval-only``, ``--output-format {ply,ckpt}``, ``--ssim-lambda``.
 
 #### Known Issues
-For the Park scene it tries to generate black gaussians to cover the sky. The enitre scene is encased in these gaussians.
+For the Park scene it tries to generate black gaussians to cover the sky. The entire scene is encased in these gaussians.
