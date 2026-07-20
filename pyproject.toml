@@ -5,11 +5,13 @@ version = "0.1.0"
 
 dependencies = ["nerfstudio >= 1.1.0", "open3d", "tyro"]
 
-[project.scripts]
-qed-init-pc = "qed_splatter.create_init_pointcloud:entrypoint"
-
 [tool.setuptools.packages.find]
 include = ["qed_splatter*"]
+
+[project.scripts]
+qed-init-pc = "qed_splatter.create_init_pointcloud:entrypoint"
+qed-rgb-prune = "qed_splatter.rgb_hard_pruner:entrypoint"
+qed-depth-prune = "qed_splatter.depth_hard_pruner:entrypoint"
 
 # register the entry point of your new method here:
 [project.entry-points.'nerfstudio.method_configs']

@@ -34,3 +34,32 @@ To train the new method, use the following command:
 ```
 ns-train qed-splatter --data [PATH]
 ```
+
+## Pruning Extension
+
+Post-training hard pruners that reduce gaussian count. They follow the same pattern as
+[dn-splatter's mesh export](https://github.com/maturk/dn-splatter/blob/main/dn_splatter/export_mesh.py):
+
+1. ``eval_setup(--load-config)`` loads the training config, dataparser, and checkpoint
+2. Scoring uses ``SplatfactoModel.get_outputs`` over the train cameras
+3. Export uses nerfstudio's ``ExportGaussianSplat.write_ply`` (or a ``.ckpt``)
+
+```
+pip install -e .
+```
+
+### RGB
+```
+qed-rgb-prune --load-config outputs/park/qed-splatter/*/config.yml --output-dir exports/ --pruning-ratio 0.1
+```
+
+### Depth
+Requires a depth-aware run (e.g. qed-splatter).
+```
+qed-depth-prune --load-config outputs/park/qed-splatter/*/config.yml --output-dir exports/ --pruning-ratio 0.1
+```
+
+Useful flags: ``--output-filename``, ``--output-format {ply,ckpt}``, ``--eval-only``, ``--ssim-lambda``.
+
+#### Known Issues
+For the Park scene it tries to generate black gaussians to cover the sky. The entire scene is encased in these gaussians.
