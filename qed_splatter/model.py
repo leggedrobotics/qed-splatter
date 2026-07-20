@@ -15,15 +15,19 @@ from nerfstudio.utils.misc import torch_compile
 import torchvision.transforms.functional as TF
 from qed_splatter.metrics import RGBMetrics, DepthMetrics
 
-@torch_compile()
+
+# Pre-create the flip tensor for get_viewmat to avoid tracing issues
+_FLIP_GSPLAT = torch.tensor([[[1, -1, -1]]], dtype=torch.float32)
+
 def get_viewmat(optimized_camera_to_world):
     """
-    function that converts c2w to gsplat world2camera matrix, using compile for some speed
+    function that converts c2w to gsplat world2camera matrix
     """
     R = optimized_camera_to_world[:, :3, :3]  # 3 x 3
     T = optimized_camera_to_world[:, :3, 3:4]  # 3 x 1
     # flip the z and y axes to align with gsplat conventions
-    R = R * torch.tensor([[[1, -1, -1]]], device=R.device, dtype=R.dtype)
+    flip = _FLIP_GSPLAT.to(R.device, R.dtype)
+    R = R * flip
     # analytic matrix inverse to get world2camera matrix
     R_inv = R.transpose(1, 2)
     T_inv = -torch.bmm(R_inv, T)
@@ -40,6 +44,7 @@ class QEDSplatterModelConfig(SplatfactoModelConfig):
     depth_lambda: float = 0.2  # Weight for depth loss, found 0.2 to 0.3 to work well
     # random_scale: float = 100.0  # Random scale for the gaussians, set to 1 if you enable scaling
     output_depth_during_training: bool = True
+    # use_bilateral_grid: bool = False  # Needs to be added for nerfstudio 1.1.3
 
 
 class QEDSplatterModel(SplatfactoModel):
@@ -91,8 +96,13 @@ class QEDSplatterModel(SplatfactoModel):
             depth_out = depth_out * mask
             depth_batch = depth_batch * mask
 
-        # Create a validity mask: only consider finite values (i.e., exclude NaN, +Inf, -Inf)
-        valid_mask = torch.isfinite(depth_out) & torch.isfinite(depth_batch)
+        # Create a validity mask: only consider finite, non-zero GT depth
+        # (zeros typically mark invalid / missing depth)
+        valid_mask = (
+            torch.isfinite(depth_out)
+            & torch.isfinite(depth_batch)
+            & (depth_batch > 0.0)
+        )
 
         # Apply the mask
         valid_depth_out = depth_out[valid_mask]
@@ -138,7 +148,7 @@ class QEDSplatterModel(SplatfactoModel):
                 sensor_depth_gt = batch["depth_image"]
 
         metrics_dict = {}
-        gt_rgb = gt_img.to(self.device)  # RGB or RGBA image
+        gt_rgb = gt_img[..., :3].to(self.device)  # RGB or RGBA image
         predicted_rgb = (
             outputs["rgb"][0, ...] if outputs["rgb"].dim() == 4 else outputs["rgb"]
         )
